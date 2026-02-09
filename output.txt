@@ -1,0 +1,5 @@
+Verifying Tool Loading in Executor...
+WARNING: TAVILY_API_KEY not found in environment. Search tools will be disabled.
+Tools loaded (No Key): ['write_file', 'read_file', 'list_dir', 'execute_python_code', 'run_pytest', 'get_committed_step_history']
+Tools loaded (With Key): ['write_file', 'read_file', 'list_dir', 'execute_python_code', 'run_pytest', 'get_committed_step_history', 'tavily_search']
+Verification SUCCESS: Tools load correctly based on environment.

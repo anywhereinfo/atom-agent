@@ -1,0 +1,11 @@
+langchain
+langgraph
+langchain-core
+sentence-transformers
+python-dotenv
+torch
+pytest
+sentencepiece
+tavily-python
+langchain-community
+langchain-tavily
