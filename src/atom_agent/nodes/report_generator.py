@@ -6,7 +6,24 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from ..state import AgentState
 from ..workspace import Workspace
 from ..config import get_llm
+
 from ..prompts.report_prompts import REPORT_SYSTEM_PROMPT, REPORT_USER_PROMPT
+
+
+def _normalize_llm_content(content) -> str:
+    """Normalize LLM response content to a plain string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                if "text" in part:
+                    parts.append(part["text"])
+        return "".join(parts)
+    return str(content)
 
 
 def _read_text_safe(path: Path, max_chars: int = 0) -> str:
@@ -330,7 +347,7 @@ def report_generator_node(state: AgentState) -> Dict[str, Any]:
     ]
 
     response = llm.invoke(messages)
-    report_content = response.content
+    report_content = _normalize_llm_content(response.content)
 
     # 4. Save report
     report_path = task_dir / "final_report.md"

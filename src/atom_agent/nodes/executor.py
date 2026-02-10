@@ -242,17 +242,44 @@ def executor_node(state: AgentState) -> dict:
 
     import time
     start_time = time.time()
-    try:
-        dynamic_agent = create_react_agent(llm, all_tools)      
-        result = dynamic_agent.invoke(
-        {"messages": all_messages},
-        config={"callbacks": [ToolLogHandler()]}
-    )
+
+    # Retry wrapper for transient network errors (timeouts, connection resets)
+    MAX_RETRIES = 3
+    RETRY_DELAYS = [30, 60, 120]  # exponential backoff
+
+    dynamic_agent = create_react_agent(llm, all_tools)
+    result = None
+    last_error = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            result = dynamic_agent.invoke(
+                {"messages": all_messages},
+                config={"callbacks": [ToolLogHandler()]}
+            )
+            monitor.stop()
+            break  # success
+        except Exception as e:
+            error_name = type(e).__name__
+            is_transient = any(keyword in error_name for keyword in [
+                "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+                "RemoteDisconnected", "ConnectionReset"
+            ]) or "timed out" in str(e).lower()
+
+            if is_transient and attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt]
+                print(f"⚠️  Transient error ({error_name}), retrying in {delay}s... (attempt {attempt + 1}/{MAX_RETRIES})", flush=True)
+                time.sleep(delay)
+                all_messages = all_messages  # preserve context
+                continue
+            else:
+                monitor.stop()
+                print(f"DEBUG: FATAL ERROR in agent executor: {str(e)}", flush=True)
+                raise e
+
+    if result is None:
         monitor.stop()
-    except Exception as e:
-        monitor.stop()
-        print(f"DEBUG: FATAL ERROR in agent executor: {str(e)}", flush=True)
-        raise e
+        raise RuntimeError("Executor failed after all retry attempts")
     
     # 4. Result Processing
     processed = _process_executor_result(result, current_step, len(all_messages), workspace)

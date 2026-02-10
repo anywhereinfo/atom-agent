@@ -204,6 +204,48 @@ def _extract_research_context(messages: List) -> str:
 # Phase 2: Plan Candidate Generation
 # ────────────────────────────────────────────────────────────
 
+def _normalize_llm_content(content) -> str:
+    """Normalize LLM response content to a plain string.
+    
+    Gemini can return content as a list of content blocks
+    (e.g., [{"type": "text", "text": "..."}]) instead of a string.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(part.get("text", str(part)))
+            else:
+                parts.append(str(part))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _extract_json_from_response(raw: str) -> str:
+    """Robustly extract JSON from an LLM response that may include markdown fences."""
+    stripped = raw.strip()
+
+    # Try 1: direct parse
+    if stripped.startswith("{"):
+        return stripped
+
+    # Try 2: extract from markdown code fences (```json ... ```)
+    fence_match = re.search(r"```(?:json)?\s*\n?(\{.*?\})\s*```", stripped, re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    # Try 3: find first { to last } (greedy)
+    brace_match = re.search(r"(\{.*\})", stripped, re.DOTALL)
+    if brace_match:
+        return brace_match.group(1).strip()
+
+    return stripped  # last resort — let json.loads raise the error
+
+
 def _generate_single_candidate(
     directive: Dict,
     task_description: str,
@@ -213,6 +255,8 @@ def _generate_single_candidate(
     available_skills_summary: str,
     historical_context: str,
     rollback_context: str,
+    task_id: str,
+    task_directory_rel: str,
 ) -> Optional[Dict]:
     """Generate a single plan candidate following a specific directive."""
     try:
@@ -230,14 +274,26 @@ def _generate_single_candidate(
 
         llm = get_llm("plan_generator")
         response = llm.invoke([HumanMessage(content=prompt)])
-        raw = response.content.strip()
+        raw = _normalize_llm_content(response.content).strip()
 
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
+        # Robustly extract JSON from the response
+        json_str = _extract_json_from_response(raw)
+        plan_data = json.loads(json_str)
 
-        plan_data = json.loads(raw)
+        # Inject server-side values — never trust the LLM to extract these
+        plan_data["task_id"] = task_id
+        plan_data["task_directory_rel"] = task_directory_rel
+
+        # Sanitize steps before Pydantic validation
+        for step in plan_data.get("steps", []):
+            # skill_instructions must be Dict[str, str] | None — LLM often outputs a string
+            si = step.get("skill_instructions")
+            if si is not None and not isinstance(si, dict):
+                step["skill_instructions"] = None
+            # estimated_complexity must be low|medium|high
+            ec = step.get("estimated_complexity", "medium")
+            if ec not in ("low", "medium", "high"):
+                step["estimated_complexity"] = "medium"
 
         # Validate with Pydantic
         validated = ImplementationPlanInput(**plan_data)
@@ -249,15 +305,17 @@ def _generate_single_candidate(
         }
 
     except json.JSONDecodeError as e:
+        preview = raw[:300] if raw else "(empty)"
         print(f"  ⚠️  Candidate '{directive['id']}': Invalid JSON — {str(e)[:100]}", flush=True)
+        print(f"  ⚠️  Raw preview: {preview}", flush=True)
         return None
     except Exception as e:
-        print(f"  ⚠️  Candidate '{directive['id']}': Failed — {str(e)[:200]}", flush=True)
+        print(f"  ⚠️  Candidate '{directive['id']}': Failed — {str(e)[:300]}", flush=True)
         return None
 
 
 def _generate_plan_candidates(
-    num_candidates: int,
+    directives: List[Dict],
     task_description: str,
     workspace_context: str,
     research_context: str,
@@ -265,17 +323,22 @@ def _generate_plan_candidates(
     available_skills_summary: str,
     historical_context: str,
     rollback_context: str,
+    task_id: str,
+    task_directory_rel: str,
 ) -> List[Dict]:
-    """Generate N diverse plan candidates, one per directive."""
-    directives = PLAN_GENERATION_DIRECTIVES[:num_candidates]
+    """
+    Generate plan candidates, one per directive.
+    Accepts the specific directives to use (allows escalation to add new ones only).
+    """
     candidates = []
+    count = len(directives)
 
     print(f"\n{'─' * 60}", flush=True)
-    print(f"PLAN GENERATOR: Generating {num_candidates} candidate plans...", flush=True)
+    print(f"PLAN GENERATOR: Generating {count} candidate plans...", flush=True)
     print(f"{'─' * 60}", flush=True)
 
     for i, directive in enumerate(directives):
-        print(f"  [{i+1}/{num_candidates}] Generating: {directive['label']}...", flush=True)
+        print(f"  [{i+1}/{count}] Generating: {directive['label']}...", flush=True)
         start = time.time()
 
         candidate = _generate_single_candidate(
@@ -287,6 +350,8 @@ def _generate_plan_candidates(
             available_skills_summary=available_skills_summary,
             historical_context=historical_context,
             rollback_context=rollback_context,
+            task_id=task_id,
+            task_directory_rel=task_directory_rel,
         )
 
         elapsed = time.time() - start
@@ -296,7 +361,7 @@ def _generate_plan_candidates(
         else:
             print(f"  ❌ '{directive['id']}': Failed ({elapsed:.1f}s)", flush=True)
 
-    print(f"\nPLAN GENERATOR: {len(candidates)}/{num_candidates} valid candidates produced.", flush=True)
+    print(f"\nPLAN GENERATOR: {len(candidates)}/{count} valid candidates produced.", flush=True)
     return candidates
 
 
@@ -377,16 +442,14 @@ def _judge_plans(
         HumanMessage(content=user_prompt),
     ])
 
-    raw = response.content.strip()
+    raw = _normalize_llm_content(response.content).strip()
     elapsed = time.time() - start
 
-    # Strip markdown fences if present
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+    # Robustly extract JSON from the response
+    json_str = _extract_json_from_response(raw)
 
     try:
-        evaluation = json.loads(raw)
+        evaluation = json.loads(json_str)
     except json.JSONDecodeError:
         print(f"  ⚠️  Judge returned invalid JSON. Falling back to candidate 0.", flush=True)
         return {
@@ -694,11 +757,16 @@ def planner_node(state: AgentState) -> dict:
     print(f"PLANNER PHASE 2: Multi-Plan Generation", flush=True)
     print(f"{'=' * 60}", flush=True)
 
+    # Extract task_id and task_directory_rel from workspace (server-side)
+    ws_task_id = workspace.task_id if workspace else "unknown_task"
+    ws_task_dir_rel = workspace.task_directory_rel if workspace else ""
+
     escalation_history = []
 
-    # Initial run: 3 candidates
+    # Initial run: 3 candidates (directives 0-2)
+    initial_directives = PLAN_GENERATION_DIRECTIVES[:DEFAULT_CANDIDATE_COUNT]
     candidates = _generate_plan_candidates(
-        num_candidates=DEFAULT_CANDIDATE_COUNT,
+        directives=initial_directives,
         task_description=task_description,
         workspace_context=workspace_context_str,
         research_context=research_context,
@@ -706,6 +774,8 @@ def planner_node(state: AgentState) -> dict:
         available_skills_summary=available_skills_summary,
         historical_context=historical_context,
         rollback_context=rollback_context,
+        task_id=ws_task_id,
+        task_directory_rel=ws_task_dir_rel,
     )
 
     # If the ReAct agent produced a valid plan, include it as a candidate
@@ -719,8 +789,8 @@ def planner_node(state: AgentState) -> dict:
                 "plan": validated.model_dump()
             })
             print(f"DEBUG: Added ReAct agent's original plan as candidate 0", flush=True)
-        except Exception:
-            print(f"DEBUG: ReAct agent's plan failed validation, excluded.", flush=True)
+        except Exception as e:
+            print(f"DEBUG: ReAct agent's plan failed validation: {str(e)[:200]}", flush=True)
 
     if not candidates:
         raise ValueError("No valid plan candidates were generated. All generation attempts failed.")
@@ -741,9 +811,10 @@ def planner_node(state: AgentState) -> dict:
         print(f"\n🔄 ESCALATION TRIGGERED: {reason}", flush=True)
         escalation_history.append(f"Round 1: {len(candidates)} candidates, escalating because: {reason}")
 
-        # Generate 2 additional candidates (directives 3-4)
+        # Generate ONLY the 2 new escalation directives (indices 3-4)
+        escalation_directives = PLAN_GENERATION_DIRECTIVES[DEFAULT_CANDIDATE_COUNT:ESCALATED_CANDIDATE_COUNT]
         extra = _generate_plan_candidates(
-            num_candidates=ESCALATED_CANDIDATE_COUNT,
+            directives=escalation_directives,
             task_description=task_description,
             workspace_context=workspace_context_str,
             research_context=research_context,
@@ -751,13 +822,12 @@ def planner_node(state: AgentState) -> dict:
             available_skills_summary=available_skills_summary,
             historical_context=historical_context,
             rollback_context=rollback_context,
+            task_id=ws_task_id,
+            task_directory_rel=ws_task_dir_rel,
         )
 
-        # Add only the new directives (indices 3-4)
-        existing_directives = {c["directive"] for c in candidates}
-        for c in extra:
-            if c["directive"] not in existing_directives:
-                candidates.append(c)
+        # Append new candidates
+        candidates.extend(extra)
 
         print(f"DEBUG: After escalation: {len(candidates)} total candidates", flush=True)
         escalation_history.append(f"Round 2: {len(candidates)} total candidates after escalation")
