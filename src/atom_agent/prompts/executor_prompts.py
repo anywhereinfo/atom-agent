@@ -54,6 +54,38 @@ Each attempt follows this loop:
 Only the presence of staged, verifiable artifacts counts as progress.
 
 ────────────────────────────────────────────────────────────
+## ANTI-PATTERN: HARDCODED OUTPUT (CRITICAL)
+
+You MUST NOT embed large string literals (>200 chars) in impl.py as
+the "output" of the step. This is the #1 quality failure mode.
+
+BAD PATTERN (FORBIDDEN):
+```python
+report = '''# My Report\n\nThis is a long hardcoded string that
+contains the entire output of the step...'''
+with open("artifacts/report.md", "w") as f:
+    f.write(report)
+```
+
+GOOD PATTERN (REQUIRED):
+```python
+# Read dependency artifacts, compute/transform, write output
+with open("steps/research/committed/artifacts/notes.md") as f:
+    research = f.read()
+# Process, analyze, transform the input data
+result = analyze(research)
+with open("artifacts/report.md", "w") as f:
+    f.write(result)
+```
+
+RULES:
+- impl.py must COMPUTE or TRANSFORM data, not CONTAIN it
+- Use tool calls (read_file, write_file, execute_python_code) for content generation
+- For research/analysis steps: read dependency artifacts, process them, produce new output
+- For code generation steps: write real, functional code — not mock/stub placeholders
+- String constants for templates, headers, or config are fine (< 200 chars each)
+
+────────────────────────────────────────────────────────────
 ## ANALYTICAL DEPTH FLOOR (CONDITIONAL)
 
 If the current step is an evaluation/comparison/benchmark/report task,
@@ -119,11 +151,19 @@ TESTING & HANDOVER (MANDATORY)
 3. If this step outputs an analytical report or comparison, tests MUST
    assert the required systems-level dimensions, complexity/cost analysis,
    determinism classification, and failure/use-case coverage.
+4. Tests MUST verify content substance, not just file existence.
+   BAD: `assert os.path.exists("artifacts/report.md")`
+   GOOD: `assert len(open("artifacts/report.md").read()) > 500`
+   BETTER: `content = open("artifacts/report.md").read(); assert "specific_keyword" in content`
+
+DEPENDENCY ARTIFACTS (READ THESE FIRST):
+{dependency_context}
 
 EXECUTION CONSTRAINTS:
 - You MUST write ONLY within: steps/{step_id}/attempts/{attempt_id}/
 - NO writing to committed/ or reflector.json.
 - Read ONLY from dependencies' committed/ directories.
+- Your impl.py MUST NOT contain string literals > 200 chars as output content.
 
 Execute this attempt now.
 """

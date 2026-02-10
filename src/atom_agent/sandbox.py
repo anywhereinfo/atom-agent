@@ -35,12 +35,14 @@ def run_in_bubblewrap(
     stdout_limit_bytes: int = 200_000,
     stderr_limit_bytes: int = 200_000,
     extra_env: Optional[Dict[str, str]] = None,
+    extra_binds: Optional[Dict[str, str]] = None,
 ) -> SandboxResult:
     """
     Run `python script_path [args...]` inside bubblewrap.
 
     attempt_dir: host path that will be bind-mounted as /work (RW)
     script_path: host path to script; must be inside attempt_dir for simplest usage
+    extra_binds: dict of {host_path: container_path} to read-only bind mount (e.g. venvs)
     """
     attempt_dir = attempt_dir.resolve()
     script_path = script_path.resolve()
@@ -61,6 +63,7 @@ def run_in_bubblewrap(
 
     args = args or []
     extra_env = extra_env or {}
+    extra_binds = extra_binds or {}
 
     # Minimal clean environment (avoid leaking secrets/proxies/credentials)
     env = {
@@ -109,6 +112,14 @@ def run_in_bubblewrap(
     # Add any extra env vars explicitly (still safe because we're not inheriting host env)
     for k, v in extra_env.items():
         bwrap_cmd += ["--setenv", k, v]
+        
+    # Add extra bind mounts (Read-Only by default for safety)
+    for host_path, container_path in extra_binds.items():
+        # Attempt to create parent directory to ensure mount point exists
+        container_parent = str(Path(container_path).parent)
+        if container_parent != "/":
+            bwrap_cmd += ["--dir", container_parent]
+        bwrap_cmd += ["--ro-bind", host_path, container_path]
 
     # We run through bash to apply ulimits without needing extra tooling.
     # You can tighten these over time.

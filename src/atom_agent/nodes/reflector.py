@@ -9,6 +9,89 @@ from ..config import get_llm
 from ..prompts.reflector_prompts import REFLECTOR_SYSTEM_PROMPT, REFLECTOR_USER_PROMPT
 from langchain_core.messages import SystemMessage, HumanMessage
 
+
+def _run_programmatic_prechecks(task_dir_rel: str, staging_paths: dict, current_step: dict) -> str:
+    """Runs machine-level quality checks on executor output before the LLM evaluation.
+    
+    Returns a formatted string of warnings for injection into the reflector prompt.
+    These checks catch systemic anti-patterns the LLM might overlook.
+    """
+    warnings = []
+    artifacts_dir = Path(task_dir_rel) / staging_paths.get("artifacts_dir", "")
+    step_id = current_step.get("step_id", "unknown")
+    attempt_num = current_step.get("current_attempt", 1)
+    attempt_id = f"a{attempt_num:02d}"
+
+    # --- CHECK 1: Hardcoded output in impl.py ---
+    impl_path = Path(task_dir_rel) / staging_paths.get("impl", "")
+    if impl_path.exists():
+        try:
+            impl_content = impl_path.read_text(errors='replace')
+            # Find triple-quoted strings > 200 chars
+            long_strings = re.findall(r'("{3}|\'{3})(.*?)\1', impl_content, re.DOTALL)
+            hardcoded_count = sum(1 for _, s in long_strings if len(s.strip()) > 200)
+            if hardcoded_count > 0:
+                warnings.append(
+                    f"⚠ HARDCODED_OUTPUT: impl.py contains {hardcoded_count} triple-quoted "
+                    f"string literal(s) exceeding 200 chars. This strongly suggests the executor "
+                    f"embedded output content directly instead of computing it via tools. "
+                    f"SCORING CAP: 0.49. DECISION: refine."
+                )
+            
+            # Also check for very large single-line strings assigned to variables
+            large_assignments = re.findall(r'=\s*["\'](.{200,})["\']', impl_content)
+            if large_assignments:
+                warnings.append(
+                    f"⚠ HARDCODED_OUTPUT: impl.py contains {len(large_assignments)} "
+                    f"variable assignment(s) with string literals > 200 chars."
+                )
+        except Exception as e:
+            warnings.append(f"⚠ PRECHECK_ERROR: Could not read impl.py: {e}")
+    else:
+        warnings.append(f"⚠ MISSING_IMPL: impl.py not found at {impl_path}")
+
+    # --- CHECK 2: Existence-only tests ---
+    test_path = Path(task_dir_rel) / staging_paths.get("test", "")
+    if test_path.exists():
+        try:
+            test_content = test_path.read_text(errors='replace')
+            existence_checks = len(re.findall(r'os\.path\.exists\(|Path\(.*?\.exists\(', test_content))
+            content_checks = len(re.findall(
+                r'assert.*(?:len\(|in |==|!=|\.read|content|json\.load)', test_content
+            ))
+            if existence_checks > 0 and content_checks == 0:
+                warnings.append(
+                    f"⚠ SHALLOW_TESTS: test.py contains {existence_checks} file-existence "
+                    f"check(s) but 0 content-validation assertions. Tests verify that files "
+                    f"exist but NOT that they contain correct/meaningful content. "
+                    f"SCORING CAP: 0.59."
+                )
+        except Exception as e:
+            warnings.append(f"⚠ PRECHECK_ERROR: Could not read test.py: {e}")
+
+    # --- CHECK 3: Dependency reference missing ---
+    deps = current_step.get("dependencies", [])
+    if deps and impl_path.exists():
+        try:
+            impl_content = impl_path.read_text(errors='replace')
+            ref_found = any(
+                dep_id in impl_content or "committed" in impl_content
+                for dep_id in deps
+            )
+            if not ref_found:
+                warnings.append(
+                    f"⚠ DEPENDENCY_NOT_REFERENCED: Step has dependencies {deps} but "
+                    f"impl.py contains no reference to these step IDs or 'committed/' paths. "
+                    f"The executor may have ignored dependency artifacts. SCORING CAP: 0.59."
+                )
+        except Exception:
+            pass
+
+    if not warnings:
+        return "No programmatic warnings. All pre-checks passed."
+    
+    return "\n".join(warnings)
+
 def reflector_node(state: AgentState) -> Dict[str, Any]:
     """
     Evaluates the Executor's attempt using an LLM to produce a structured Review JSON.
@@ -83,6 +166,11 @@ def reflector_node(state: AgentState) -> Dict[str, Any]:
     criteria = current_step.get("acceptance_criteria", [])
     numbered_criteria = "\n".join([f"{i+1}. {c}" for i, c in enumerate(criteria)])
 
+    # F. Programmatic Pre-checks
+    programmatic_warnings = _run_programmatic_prechecks(
+        task_dir_rel, staging_paths, current_step
+    )
+
     # --- 2. LLM INVOCATION ---
     
     user_prompt = REFLECTOR_USER_PROMPT.format(
@@ -97,14 +185,40 @@ def reflector_node(state: AgentState) -> Dict[str, Any]:
         execution_summary="See recent messages for detailed trace.",
         recent_messages=recent_messages_str,
         artifacts_summary=artifacts_summary,
-        test_results_summary=test_results_summary
+        test_results_summary=test_results_summary,
+        programmatic_warnings=programmatic_warnings
     )
 
     llm = get_llm("reflector")
-    response = llm.invoke([
-        SystemMessage(content=REFLECTOR_SYSTEM_PROMPT),
-        HumanMessage(content=user_prompt)
-    ])
+    import time
+    
+    # Retry wrapper for transient network errors
+    MAX_RETRIES = 3
+    RETRY_DELAYS = [10, 20, 40]
+    response = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = llm.invoke([
+                SystemMessage(content=REFLECTOR_SYSTEM_PROMPT),
+                HumanMessage(content=user_prompt)
+            ])
+            break
+        except Exception as e:
+            error_name = type(e).__name__
+            is_transient = any(keyword in error_name for keyword in [
+                "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+                "RemoteDisconnected", "ConnectionReset"
+            ]) or "timed out" in str(e).lower()
+
+            if is_transient and attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt]
+                print(f"⚠️  Reflector transient error ({error_name}), retrying in {delay}s...", flush=True)
+                time.sleep(delay)
+                continue
+            else:
+                print(f"DEBUG: FATAL ERROR in reflector: {str(e)}", flush=True)
+                raise e
 
     # --- 3. PARSING & VALIDATION ---
     content = response.content

@@ -41,6 +41,17 @@ SCORING LOGIC (DETERMINISTIC)
     2. Tests failed → cap 0.49
     3. Required artifact missing → cap 0.49
     4. Dependency failed/incomplete → decision = rollback
+    5. HARDCODED OUTPUT detected (impl.py contains string literals >200 chars
+       that are written directly to artifact files) → cap 0.49, decision = refine,
+       add issue: "hardcoded_output: impl.py embeds large string literals instead
+       of computing/transforming content"
+    6. EXISTENCE-ONLY TESTS detected (tests only assert file existence via
+       os.path.exists() without content validation) → cap 0.59, add issue:
+       "shallow_tests: tests verify file existence but not content quality"
+    7. DEPENDENCY REFERENCE MISSING: if step has dependencies but artifacts
+       show no evidence of reading from committed/ dependency paths → cap 0.59,
+       add issue: "dependency_not_referenced: step has dependencies but output
+       shows no cross-reference to prior step artifacts"
 - Missing tests: If no results → cap 0.69 (forces refine unless explicitly allowed).
 - Partial criteria: pass_rate = passed / total
     - pass_rate >= 0.80 → cap 0.79
@@ -49,6 +60,12 @@ SCORING LOGIC (DETERMINISTIC)
 - Attempt handling:
     - If attempt_number >= 3 → bias toward rollback unless trivial fix.
     - If attempt_number >= max_attempts - 1 → strongly bias rollback.
+
+CONTENT DEPTH VALIDATION
+- You MUST check artifacts for substance, not just existence.
+- A 50-line report that contains only headers and filler text is NOT sufficient.
+- If the PROGRAMMATIC WARNINGS section contains warnings, you MUST address each one.
+  These are machine-generated checks that cannot be ignored.
 
 MINIMAL ROUTING CONTRACT
 - proceed: confidence_score >= 0.70 AND no blocking caps.
@@ -93,10 +110,14 @@ Test Results Summary:
 {test_results_summary}
 NOTE: If no test results exist, this field will be exactly: NO_TEST_RESULTS
 
+Programmatic Warnings (machine-generated, CANNOT be ignored):
+{programmatic_warnings}
+
 ────────────────────────────────────────
 
 Instructions:
 - Evaluate strictly using the objective evidence.
 - You MUST evaluate every acceptance criterion individually and output `criteria_evaluation`.
+- Address every programmatic warning above — each one MUST appear in issues_identified if confirmed.
 - Return ONLY a valid JSON object following the required schema. No markdown fences.
 """

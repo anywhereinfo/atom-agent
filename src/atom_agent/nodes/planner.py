@@ -273,7 +273,30 @@ def _generate_single_candidate(
         )
 
         llm = get_llm("plan_generator")
-        response = llm.invoke([HumanMessage(content=prompt)])
+        
+        # Retry wrapper for transient network errors
+        MAX_RETRIES = 3
+        RETRY_DELAYS = [10, 20, 40]  # Standard backoff
+        response = None
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = llm.invoke([HumanMessage(content=prompt)])
+                break
+            except Exception as e:
+                error_name = type(e).__name__
+                is_transient = any(keyword in error_name for keyword in [
+                    "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+                    "RemoteDisconnected", "ConnectionReset"
+                ]) or "timed out" in str(e).lower()
+
+                if is_transient and attempt < MAX_RETRIES:
+                    delay = RETRY_DELAYS[attempt]
+                    print(f"  ⚠️  Transient error ({error_name}) in candidate gen, retrying in {delay}s...", flush=True)
+                    time.sleep(delay)
+                    continue
+                else:
+                    raise e
         raw = _normalize_llm_content(response.content).strip()
 
         # Robustly extract JSON from the response
@@ -334,32 +357,48 @@ def _generate_plan_candidates(
     count = len(directives)
 
     print(f"\n{'─' * 60}", flush=True)
-    print(f"PLAN GENERATOR: Generating {count} candidate plans...", flush=True)
+    print(f"PLAN GENERATOR: Generating {count} candidate plans (PARALLEL)...", flush=True)
     print(f"{'─' * 60}", flush=True)
 
-    for i, directive in enumerate(directives):
-        print(f"  [{i+1}/{count}] Generating: {directive['label']}...", flush=True)
-        start = time.time()
+    # Use ThreadPoolExecutor for parallel generation
+    # We use a max_workers cap (e.g., 5) to avoid hitting rate limits too aggressively,
+    # though our rate limit handler should manage that at the config level.
+    max_workers = min(count, 5)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_directive = {}
+        for directive in directives:
+            print(f"  [Scheduled] {directive['label']}...", flush=True)
+            future = executor.submit(
+                _generate_single_candidate,
+                directive=directive,
+                task_description=task_description,
+                workspace_context=workspace_context,
+                research_context=research_context,
+                skill_name=skill_name,
+                available_skills_summary=available_skills_summary,
+                historical_context=historical_context,
+                rollback_context=rollback_context,
+                task_id=task_id,
+                task_directory_rel=task_directory_rel,
+            )
+            future_to_directive[future] = directive
 
-        candidate = _generate_single_candidate(
-            directive=directive,
-            task_description=task_description,
-            workspace_context=workspace_context,
-            research_context=research_context,
-            skill_name=skill_name,
-            available_skills_summary=available_skills_summary,
-            historical_context=historical_context,
-            rollback_context=rollback_context,
-            task_id=task_id,
-            task_directory_rel=task_directory_rel,
-        )
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(future_to_directive):
+            directive = future_to_directive[future]
+            try:
+                candidate = future.result()
+                if candidate:
+                    print(f"  ✅ '{directive['id']}': {candidate['steps_count']} steps (Complete)", flush=True)
+                    candidates.append(candidate)
+                else:
+                    print(f"  ❌ '{directive['id']}': Failed (returned None)", flush=True)
+            except Exception as e:
+                print(f"  ❌ '{directive['id']}': Exception: {str(e)}", flush=True)
 
-        elapsed = time.time() - start
-        if candidate:
-            print(f"  ✅ '{directive['id']}': {candidate['steps_count']} steps ({elapsed:.1f}s)", flush=True)
-            candidates.append(candidate)
-        else:
-            print(f"  ❌ '{directive['id']}': Failed ({elapsed:.1f}s)", flush=True)
+    # Sort candidates to ensure deterministic order (by directive ID) for the Judge
+    candidates.sort(key=lambda c: c['directive'])
 
     print(f"\nPLAN GENERATOR: {len(candidates)}/{count} valid candidates produced.", flush=True)
     return candidates
@@ -437,10 +476,33 @@ def _judge_plans(
     llm = get_llm("plan_judge")
     start = time.time()
 
-    response = llm.invoke([
-        SystemMessage(content=PLAN_JUDGE_SYSTEM_PROMPT),
-        HumanMessage(content=user_prompt),
-    ])
+    # Retry wrapper for transient network errors
+    MAX_RETRIES = 3
+    RETRY_DELAYS = [5, 10, 20]  # shorter backoff for judge
+    response = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = llm.invoke([
+                SystemMessage(content=PLAN_JUDGE_SYSTEM_PROMPT),
+                HumanMessage(content=user_prompt),
+            ])
+            break  # success
+        except Exception as e:
+            error_name = type(e).__name__
+            is_transient = any(keyword in error_name for keyword in [
+                "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+                "RemoteDisconnected", "ConnectionReset"
+            ]) or "timed out" in str(e).lower()
+
+            if is_transient and attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt]
+                print(f"⚠️  Transient error ({error_name}) in judge, retrying in {delay}s... (attempt {attempt + 1}/{MAX_RETRIES})", flush=True)
+                time.sleep(delay)
+                continue
+            else:
+                print(f"DEBUG: FATAL ERROR in plan judge: {str(e)}", flush=True)
+                raise e
 
     raw = _normalize_llm_content(response.content).strip()
     elapsed = time.time() - start

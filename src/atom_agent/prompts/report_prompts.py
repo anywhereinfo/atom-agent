@@ -69,10 +69,22 @@ For each research phase, list:
 - Be thorough — aim for 3000-5000 words
 - Use Markdown formatting: headers, tables, ordered/unordered lists, bold/italic emphasis
 - When comparing items, use tables rather than prose for clarity
+
+## Score Calibration Rules (MANDATORY)
+- The report MUST include a "Known Limitations" section that references:
+  1. Judge-identified weaknesses from the plan evaluation
+  2. Any issues flagged by the reflector across steps
+  3. Steps that required multiple attempts (indicating difficulty or quality issues)
+- The self-reported overall score MUST be justified with specific evidence citations
+- The self-reported score MUST NOT exceed the Recommended Score Ceiling provided in the quality summary
+- If the quality summary shows a low average reflector confidence (< 0.70) or low criteria pass rate (< 80%), the report MUST explicitly acknowledge this as a limitation
 """
 
 REPORT_USER_PROMPT = """## Task Objective
 {task_description}
+
+## Quality Summary (CALIBRATION BASELINE — DO NOT IGNORE)
+{quality_summary}
 
 ## Research Methodology (Execution Plan)
 {plan_summary}
@@ -90,4 +102,6 @@ CRITICAL REQUIREMENTS:
 3. The Results section MUST include the reflector's per-criterion evaluation for each phase
 4. If any step required multiple attempts, the iteration history MUST be discussed
 5. Use tables for any comparative analysis
+6. The overall score MUST NOT exceed the Recommended Score Ceiling from the Quality Summary
+7. Include a "Known Limitations" section that references judge weaknesses and reflector issues
 """

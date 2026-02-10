@@ -76,12 +76,15 @@ class SlackAtomBot:
         print(f"📩 New task from <@{user_id}>: {text[:100]}...", flush=True)
         print(f"{'═' * 60}", flush=True)
 
-        # Acknowledge the message
-        client.reactions_add(
-            channel=self.channel_id,
-            timestamp=message_ts,
-            name="brain",  # 🧠 emoji
-        )
+        # Acknowledge the message (try/except for missing permissions)
+        try:
+            client.reactions_add(
+                channel=self.channel_id,
+                timestamp=message_ts,
+                name="brain",  # 🧠 emoji
+            )
+        except Exception as e:
+            print(f"⚠️  Could not add reaction (check 'reactions:write' scope): {e}", flush=True)
 
         # Post initial reply in a thread
         reply = client.chat_postMessage(
@@ -126,12 +129,16 @@ class SlackAtomBot:
                     last_node = node_name
                     self._post_node_update(client, thread_ts, node_name, state_update)
 
-            # Final success message
-            client.reactions_add(
-                channel=self.channel_id,
-                timestamp=thread_ts,
-                name="white_check_mark",  # ✅
-            )
+            # Final success message (try/except for missing permissions)
+            try:
+                client.reactions_add(
+                    channel=self.channel_id,
+                    timestamp=thread_ts,
+                    name="white_check_mark",  # ✅
+                )
+            except Exception:
+                pass  # Ignore reaction errors
+            
             self._post_thread(client, thread_ts, "✅ *Agent run complete!*")
 
         except Exception as e:
@@ -139,7 +146,7 @@ class SlackAtomBot:
             self._post_thread(client, thread_ts, error_msg)
             print(f"ERROR in agent run: {traceback.format_exc()}", flush=True)
 
-            # Add failure reaction
+            # Add failure reaction (try/except for missing permissions)
             try:
                 client.reactions_add(
                     channel=self.channel_id,
@@ -194,4 +201,33 @@ class SlackAtomBot:
             self._post_thread(client, thread_ts, "💾 *Step committed*")
 
         elif node_name == "report_generator":
-            self._post_thread(client, thread_ts, "📄 *Final report generated*")
+            # Extract report path from progress reports
+            progress = state_update.get("progress_reports", [])
+            report_path = None
+            for p in progress:
+                # Look for "Final report generated: <path>"
+                if "Final report generated:" in p:
+                    try:
+                        report_path = p.split("Final report generated:")[1].strip()
+                    except IndexError:
+                        pass
+            
+            if report_path and os.path.exists(report_path):
+                self._post_thread(client, thread_ts, f"📄 *Final report generated:* `{report_path}`\nUploading artifact...")
+                self._upload_file(client, thread_ts, report_path)
+            else:
+                self._post_thread(client, thread_ts, "📄 *Final report generated* (path not found)")
+
+    def _upload_file(self, client, thread_ts, file_path):
+        """Upload a file to the Slack thread."""
+        try:
+            client.files_upload_v2(
+                channel=self.channel_id,
+                thread_ts=thread_ts,
+                file=file_path,
+                title=os.path.basename(file_path),
+                initial_comment="Here is your requested report 📊"
+            )
+        except Exception as e:
+            print(f"⚠️  Failed to upload file to Slack (check 'files:write' scope): {e}", flush=True)
+            self._post_thread(client, thread_ts, f"⚠️  Could not upload report artifact (missing permissions?)\nPath: `{file_path}`")

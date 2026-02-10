@@ -10,3 +10,5 @@ tavily-python
 langchain-community
 langchain-tavily
 arxiv
+slack_bolt
+slack_sdk

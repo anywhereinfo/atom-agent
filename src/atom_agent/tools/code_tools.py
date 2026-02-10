@@ -26,6 +26,28 @@ def create_code_tools(workspace: Workspace) -> List:
         # Return path relative to task_dir_abs for use in sandbox
         return str(p)
 
+        # Return path relative to task_dir_abs for use in sandbox
+        return str(p)
+
+    # Detect if we are running in a venv
+    extra_binds = {}
+    extra_env = {}
+
+    if sys.prefix != sys.base_prefix:
+        venv_path = Path(sys.prefix).resolve()
+        # implementation detail: assume standard venv layout (lib/pythonX.Y/site-packages)
+        version_str = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = venv_path / "lib" / version_str / "site-packages"
+        
+        if site_packages.exists():
+            # Bind ONLY the site-packages, not the whole venv
+            # This addresses security concerns about exposing secrets/keys in venv root/bin
+            extra_binds[str(site_packages)] = "/venv_packages"
+            extra_env["PYTHONPATH"] = "/venv_packages"
+            print(f"DEBUG TOOLS: Detected venv, binding site-packages {site_packages} to /venv_packages", flush=True)
+        else:
+            print(f"DEBUG TOOLS: Detected venv at {venv_path} but could not find site-packages at {site_packages}", flush=True)
+
     @tool
     def execute_python_code(code: str) -> str:
         """
@@ -49,6 +71,8 @@ def create_code_tools(workspace: Workspace) -> List:
             result = run_in_bubblewrap(
                 attempt_dir=task_dir_abs,
                 script_path=script_path,
+                extra_binds=extra_binds,
+                extra_env=extra_env,
                 timeout_s=30
             )
             
@@ -94,6 +118,8 @@ def create_code_tools(workspace: Workspace) -> List:
                 attempt_dir=task_dir_abs,
                 script_path=driver_path,
                 args=[safe_test_path],
+                extra_binds=extra_binds,
+                extra_env=extra_env,
                 timeout_s=60
             )
             

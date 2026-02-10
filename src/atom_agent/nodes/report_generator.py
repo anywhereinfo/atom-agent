@@ -54,7 +54,8 @@ def _collect_task_data(task_dir: Path) -> Dict[str, Any]:
     data = {
         "task": {},
         "plan": {},
-        "steps": {}
+        "steps": {},
+        "judge": {}  # Plan judge evaluation data
     }
 
     # 1. Task metadata
@@ -66,6 +67,27 @@ def _collect_task_data(task_dir: Path) -> Dict[str, Any]:
     plan_json = task_dir / "state" / "plan.json"
     if plan_json.exists():
         data["plan"] = _read_json_safe(plan_json)
+
+    # 2b. Plan Candidates (judge evaluation with scores and weaknesses)
+    candidates_json = task_dir / "state" / "plan_candidates.json"
+    if candidates_json.exists():
+        candidates_data = _read_json_safe(candidates_json)
+        judge_eval = candidates_data.get("judge_evaluation", {})
+        if judge_eval:
+            selected_idx = judge_eval.get("selected_index", 0)
+            evaluations = judge_eval.get("evaluations", [])
+            selected_eval = next(
+                (e for e in evaluations if e.get("candidate_index") == selected_idx),
+                evaluations[0] if evaluations else {}
+            )
+            data["judge"] = {
+                "total_score": selected_eval.get("total_score", 0),
+                "max_possible": 60,  # 6 dimensions × 10 max
+                "weaknesses": selected_eval.get("weaknesses", []),
+                "strengths": selected_eval.get("strengths", []),
+                "risk_level": judge_eval.get("risk_level", "unknown"),
+                "selection_reasoning": judge_eval.get("selection_reasoning", "")
+            }
 
     # 3. Per-step: committed evidence + attempt history + reflector reports
     steps_dir = task_dir / "steps"
@@ -297,6 +319,72 @@ def _format_step_evidence(steps_data: Dict[str, Dict]) -> str:
     return "\n".join(lines)
 
 
+def _compute_quality_summary(task_data: Dict[str, Any]) -> str:
+    """Computes aggregate quality metrics from collected evidence.
+    
+    Provides the report writer with a concrete quality baseline
+    that prevents score inflation.
+    """
+    lines = []
+    
+    # Judge score
+    judge = task_data.get("judge", {})
+    if judge:
+        judge_score = judge.get("total_score", 0)
+        judge_max = judge.get("max_possible", 60)
+        judge_pct = (judge_score / judge_max * 100) if judge_max > 0 else 0
+        lines.append(f"**Plan Judge Score**: {judge_score}/{judge_max} ({judge_pct:.0f}%)")
+        lines.append(f"**Risk Level**: {judge.get('risk_level', 'unknown')}")
+        weaknesses = judge.get("weaknesses", [])
+        if weaknesses:
+            lines.append("**Judge-Identified Weaknesses**:")
+            for w in weaknesses:
+                lines.append(f"  - {w}")
+    
+    # Aggregate reflector metrics
+    steps = task_data.get("steps", {})
+    confidence_scores = []
+    criteria_pass_count = 0
+    criteria_total_count = 0
+    total_retries = 0
+    
+    for step_id, step_data in steps.items():
+        reflector = step_data.get("reflector_report", {})
+        if reflector:
+            score = reflector.get("confidence_score")
+            if score is not None:
+                confidence_scores.append(score)
+            
+            for ce in reflector.get("criteria_evaluation", []):
+                criteria_total_count += 1
+                if ce.get("status") == "pass":
+                    criteria_pass_count += 1
+        
+        attempts = step_data.get("attempt_history", [])
+        if len(attempts) > 1:
+            total_retries += len(attempts) - 1
+    
+    if confidence_scores:
+        avg_confidence = sum(confidence_scores) / len(confidence_scores)
+        lines.append(f"**Average Reflector Confidence**: {avg_confidence:.2f}")
+    
+    if criteria_total_count > 0:
+        pass_rate = criteria_pass_count / criteria_total_count
+        lines.append(f"**Criteria Pass Rate**: {criteria_pass_count}/{criteria_total_count} ({pass_rate:.0%})")
+    
+    lines.append(f"**Total Retries**: {total_retries}")
+    
+    # Compute recommended score ceiling
+    if judge and confidence_scores:
+        judge_pct = judge.get("total_score", 0) / judge.get("max_possible", 60) * 100
+        avg_conf_pct = avg_confidence * 100
+        ceiling = min(judge_pct + 15, avg_conf_pct + 10, 100)
+        lines.append(f"**Recommended Score Ceiling**: {ceiling:.0f}/100 "
+                     f"(based on judge={judge_pct:.0f}% + 15% margin, reflector avg={avg_conf_pct:.0f}% + 10%)")
+
+    return "\n".join(lines) if lines else "No quality metrics available."
+
+
 def report_generator_node(state: AgentState) -> Dict[str, Any]:
     """
     Final node: Scans the task directory for all committed evidence
@@ -327,10 +415,14 @@ def report_generator_node(state: AgentState) -> Dict[str, Any]:
     plan_summary = _format_plan_summary(task_data.get("plan", {}))
     step_evidence = _format_step_evidence(task_data.get("steps", {}))
 
+    # 2b. Compute aggregate quality metrics
+    quality_summary = _compute_quality_summary(task_data)
+
     user_prompt = REPORT_USER_PROMPT.format(
         task_description=task_description,
         plan_summary=plan_summary,
-        step_evidence=step_evidence
+        step_evidence=step_evidence,
+        quality_summary=quality_summary
     )
 
     # Log context size for debugging
@@ -346,7 +438,32 @@ def report_generator_node(state: AgentState) -> Dict[str, Any]:
         HumanMessage(content=user_prompt)
     ]
 
-    response = llm.invoke(messages)
+    import time
+    
+    # Retry wrapper for transient network errors
+    MAX_RETRIES = 3
+    RETRY_DELAYS = [10, 20, 40]
+    response = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = llm.invoke(messages)
+            break
+        except Exception as e:
+            error_name = type(e).__name__
+            is_transient = any(keyword in error_name for keyword in [
+                "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+                "RemoteDisconnected", "ConnectionReset"
+            ]) or "timed out" in str(e).lower()
+
+            if is_transient and attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt]
+                print(f"⚠️  Report Gen transient error ({error_name}), retrying in {delay}s...", flush=True)
+                time.sleep(delay)
+                continue
+            else:
+                print(f"DEBUG: FATAL ERROR in report generator: {str(e)}", flush=True)
+                raise e
     report_content = _normalize_llm_content(response.content)
 
     # 4. Save report
@@ -362,7 +479,9 @@ def report_generator_node(state: AgentState) -> Dict[str, Any]:
         "report_path": str(report_path),
         "report_size_chars": len(report_content),
         "context_size_chars": total_context,
-        "model_used": "reflector"
+        "model_used": "reflector",
+        "judge_score": task_data.get("judge", {}).get("total_score"),
+        "judge_max": 60
     }
     meta_path = task_dir / "report_metadata.json"
     with open(meta_path, "w", encoding="utf-8") as f:

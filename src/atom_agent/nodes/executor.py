@@ -65,6 +65,69 @@ def _load_executor_tools(current_step: dict, workspace: Workspace) -> list:
     
     return file_tools + code_tools + memory_tools + search_tools
 
+def _build_dependency_context(state: AgentState, current_step: dict) -> str:
+    """Builds a context string listing committed artifact paths from dependency steps.
+    
+    This gives the executor explicit knowledge of which files to read_file() from,
+    preventing hallucinated or hardcoded content.
+    """
+    workspace = state.get("workspace")
+    if not workspace:
+        return "No workspace available — cannot resolve dependency artifacts."
+
+    deps = current_step.get("dependencies", [])
+    if not deps:
+        return "This step has no dependencies. Generate all content via tools and computation."
+
+    plan = state.get("implementation_plan", [])
+    step_map = {s.get("step_id"): s for s in plan}
+    task_dir = Path(workspace.task_directory_rel)
+
+    sections = []
+    for dep_id in deps:
+        dep_step = step_map.get(dep_id)
+        if not dep_step:
+            sections.append(f"### {dep_id}\n⚠ Dependency step not found in plan.")
+            continue
+
+        try:
+            committed_dir_template = workspace.get_path("committed_dir", step_id=dep_id)
+            committed_path = task_dir / committed_dir_template
+        except KeyError:
+            sections.append(f"### {dep_id}\n⚠ Cannot resolve committed path.")
+            continue
+
+        if not committed_path.exists():
+            sections.append(f"### {dep_id}\n⚠ Committed directory does not exist yet (step may not have completed).")
+            continue
+
+        # List committed artifacts
+        artifacts_dir = committed_path / "artifacts"
+        artifact_list = []
+        if artifacts_dir.exists():
+            for f in sorted(artifacts_dir.iterdir()):
+                if f.is_file():
+                    rel_path = str(f)
+                    artifact_list.append(f"  - `{rel_path}` ({f.stat().st_size} bytes)")
+        
+        # Also check for committed impl.py / manifest
+        for fname in ["manifest.json", "impl.py"]:
+            fpath = committed_path / fname
+            if fpath.exists():
+                artifact_list.append(f"  - `{str(fpath)}` ({fpath.stat().st_size} bytes)")
+
+        section = f"### {dep_id} — \"{dep_step.get('title', 'Untitled')}\"\n"
+        section += f"Description: {dep_step.get('description', 'N/A')}\n"
+        if artifact_list:
+            section += f"Committed artifacts (use read_file to access):\n" + "\n".join(artifact_list)
+        else:
+            section += "No committed artifacts found."
+        
+        sections.append(section)
+
+    return "\n\n".join(sections) if sections else "No dependency artifacts resolved."
+
+
 def _prepare_executor_messages(state: AgentState, current_step: dict) -> list:
     """Constructs tiered messages for the executor agent using the filesystem index."""
     workspace = state.get("workspace")
@@ -79,7 +142,10 @@ def _prepare_executor_messages(state: AgentState, current_step: dict) -> list:
     # 2. Acceptance criteria
     criteria_list = "\n".join([f"- {c}" for c in current_step.get("acceptance_criteria", [])])
 
-    # 3. Format the primary User Instruction
+    # 3. Build dependency context (committed artifact paths from dep steps)
+    dependency_context = _build_dependency_context(state, current_step)
+
+    # 4. Format the primary User Instruction
     user_msg_content = EXECUTOR_USER_PROMPT.format(
         step_id=step_id,
         attempt_id=attempt_id,
@@ -88,7 +154,8 @@ def _prepare_executor_messages(state: AgentState, current_step: dict) -> list:
         acceptance_criteria=criteria_list,
         staged_impl_path=staging_paths.get("impl", "unknown"),
         staged_test_path=staging_paths.get("test", "unknown"),
-        staged_artifacts_dir=staging_paths.get("artifacts_dir", "unknown")
+        staged_artifacts_dir=staging_paths.get("artifacts_dir", "unknown"),
+        dependency_context=dependency_context
     )
 
     if current_step.get("skill_instructions"):
@@ -96,7 +163,7 @@ def _prepare_executor_messages(state: AgentState, current_step: dict) -> list:
         inst_str = "\n".join([f"  - *{skill}*: {text}" for skill, text in inst_map.items()]) if isinstance(inst_map, dict) else inst_map
         user_msg_content += f"\n\nSkill Usage Instructions:\n{inst_str}"
 
-    # 4. Use MemoryManager to reconstruct the tiered context (Tier 0-2)
+    # 5. Use MemoryManager to reconstruct the tiered context (Tier 0-2)
     # This pulls reports from previous steps (ranked by relevance) and existing history for THIS attempt.
     messages = MemoryManager.reconstruct_context(
         workspace=workspace,
