@@ -39,12 +39,21 @@ def create_code_tools(workspace: Workspace) -> List:
         version_str = f"python{sys.version_info.major}.{sys.version_info.minor}"
         site_packages = venv_path / "lib" / version_str / "site-packages"
         
+        # Resolve the local lib directory for shims
+        local_lib = (Path(__file__).parent.parent / "lib").resolve()
+        
         if site_packages.exists():
             # Bind ONLY the site-packages, not the whole venv
-            # This addresses security concerns about exposing secrets/keys in venv root/bin
             extra_binds[str(site_packages)] = "/venv_packages"
-            extra_env["PYTHONPATH"] = "/venv_packages"
-            print(f"DEBUG TOOLS: Detected venv, binding site-packages {site_packages} to /venv_packages", flush=True)
+            
+            # Combine site-packages with local shims
+            if local_lib.exists():
+                extra_binds[str(local_lib)] = "/local_lib"
+                extra_env["PYTHONPATH"] = "/local_lib:/venv_packages"
+                print(f"DEBUG TOOLS: Detected venv and local lib. PYTHONPATH: {extra_env['PYTHONPATH']}", flush=True)
+            else:
+                extra_env["PYTHONPATH"] = "/venv_packages"
+                print(f"DEBUG TOOLS: Detected venv, binding site-packages {site_packages} to /venv_packages", flush=True)
         else:
             print(f"DEBUG TOOLS: Detected venv at {venv_path} but could not find site-packages at {site_packages}", flush=True)
 

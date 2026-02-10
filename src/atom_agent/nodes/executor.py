@@ -133,11 +133,16 @@ def _prepare_executor_messages(state: AgentState, current_step: dict) -> list:
     workspace = state.get("workspace")
     task_dir_rel = workspace.task_directory_rel if workspace else "."
     step_id = current_step.get("step_id", "unknown")
-    attempt_num = current_step.get("current_attempt", 1)
-    attempt_id = f"a{attempt_num:02d}"
+    attempt = current_step.ensure_attempt() if hasattr(current_step, 'ensure_attempt') else None
+    attempt_id = attempt.attempt_id if attempt else f"a{current_step.get('current_attempt', 1):02d}"
 
-    # 1. Resolve Auth Staging Paths using the Workspace class method
-    staging_paths = workspace.get_staging_paths(step_id, attempt_id) if workspace else {}
+    # 1. Resolve staging paths via attempt workspace
+    if attempt and attempt.workspace:
+        staging_paths = attempt.workspace.get_staging_paths()
+    elif workspace:
+        staging_paths = workspace.get_staging_paths(step_id, attempt_id)
+    else:
+        staging_paths = {}
 
     # 2. Acceptance criteria
     criteria_list = "\n".join([f"- {c}" for c in current_step.get("acceptance_criteria", [])])
@@ -211,13 +216,25 @@ def _process_executor_result(result: dict, current_step: dict, history_start_idx
     # Persistence according to workspace contract
     task_dir_rel = workspace.task_directory_rel if workspace else "."
     step_id = current_step.get("step_id", "unknown")
-    attempt_num = current_step.get("current_attempt", 1)
-    attempt_id = f"a{attempt_num:02d}"
+    attempt = current_step.current_attempt() if hasattr(current_step, 'current_attempt') else None
+    attempt_num = attempt.attempt_number if attempt else current_step.get("current_attempt", 1)
+    attempt_id = attempt.attempt_id if attempt else f"a{attempt_num:02d}"
 
-    # Resolve messages dir and staging files using workspace contract
-    msg_dir_rel = workspace.get_path("step_messages_dir", step_id=step_id) if workspace else f"steps/{step_id}/messages/"
+    # Resolve messages dir and staging files via step/attempt workspace
+    step_ws = current_step.step_workspace if hasattr(current_step, 'step_workspace') else None
+    if step_ws:
+        msg_dir_rel = step_ws.get_messages_dir()
+    elif workspace:
+        msg_dir_rel = workspace.get_path("step_messages_dir", step_id=step_id)
+    else:
+        msg_dir_rel = f"steps/{step_id}/messages/"
 
-    staging_paths = workspace.get_staging_paths(step_id, attempt_id) if workspace else {}
+    if attempt and attempt.workspace:
+        staging_paths = attempt.workspace.get_staging_paths()
+    elif workspace:
+        staging_paths = workspace.get_staging_paths(step_id, attempt_id)
+    else:
+        staging_paths = {}
     impl_path_rel = staging_paths.get("impl", "")
     test_path_rel = staging_paths.get("test", "")
     errors_dir_rel = staging_paths.get("errors_dir", "")

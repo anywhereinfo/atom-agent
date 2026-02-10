@@ -12,7 +12,8 @@ from ..prompts.planner_prompts import PLANNER_SYSTEM_PROMPT, PLANNER_USER_PROMPT
 from ..prompts.plan_judge_prompts import (
     PLAN_GENERATION_DIRECTIVES,
     PLAN_GENERATION_PROMPT,
-    PLAN_JUDGE_SYSTEM_PROMPT,
+    PLAN_SCORER_SYSTEM_PROMPT,
+    PLAN_AGGREGATOR_SYSTEM_PROMPT,
     PLAN_JUDGE_USER_PROMPT,
 )
 from ..state import AgentState, PlanStep
@@ -405,47 +406,123 @@ def _generate_plan_candidates(
 
 
 # ────────────────────────────────────────────────────────────
-# Phase 3: Plan Judging
+# Phase 3: Plan Judging (Disk-Backed, Parallel)
 # ────────────────────────────────────────────────────────────
 
-def _format_candidates_for_judge(candidates: List[Dict]) -> str:
-    """Format all candidates as a numbered list for the judge."""
-    parts = []
+def _persist_candidates_to_disk(
+    task_dir: Path,
+    candidates: List[Dict],
+    start_index: int = 0,
+) -> List[Dict]:
+    """Persist each candidate plan to disk and return metadata-only refs.
+    
+    Each plan is saved to state/candidates/candidate_{i}.json.
+    The returned list replaces the full plan with a plan_path reference.
+    """
+    candidates_dir = task_dir / "state" / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    
+    refs = []
     for i, c in enumerate(candidates):
-        plan = c["plan"]
-        steps_summary = []
-        for step in plan["steps"]:
-            deps = step.get("dependencies", [])
-            criteria_count = len(step.get("acceptance_criteria", []))
-            steps_summary.append(
-                f"    - `{step['step_id']}`: {step['title']} "
-                f"[{step.get('estimated_complexity', '?')}] "
-                f"(deps: {deps or 'none'}, criteria: {criteria_count}, "
-                f"parallel: {step.get('can_run_in_parallel', False)}, "
-                f"max_attempts: {step.get('max_attempts', 3)})"
+        idx = start_index + i
+        plan_path = candidates_dir / f"candidate_{idx}.json"
+        with open(plan_path, "w") as f:
+            json.dump(c["plan"], f, indent=2)
+        
+        # Metadata-only ref (no plan in memory)
+        refs.append({
+            "directive": c["directive"],
+            "directive_label": c["directive_label"],
+            "steps_count": c["steps_count"],
+            "plan_path": str(plan_path),
+        })
+    
+    print(f"DEBUG: {len(refs)} candidate plans persisted to {candidates_dir} (indices {start_index}-{start_index+len(refs)-1})", flush=True)
+    return refs
+
+
+def _load_candidate_plan(plan_path: str) -> Dict:
+    """Load a candidate plan from disk."""
+    with open(plan_path, "r") as f:
+        return json.load(f)
+
+
+def _score_single_plan(
+    candidate_index: int,
+    candidate_ref: Dict,
+    task_description: str,
+) -> Optional[Dict]:
+    """Evaluate a single candidate plan in isolation.
+    
+    Loads the plan from disk on demand, scores it, then lets it fall out of scope.
+    Retries once on failure before returning None.
+    """
+    label = candidate_ref["directive_label"]
+    max_attempts = 2  # 1 retry
+
+    for attempt in range(max_attempts):
+        try:
+            # Load plan from disk (lazy — not held in memory)
+            plan = _load_candidate_plan(candidate_ref["plan_path"])
+
+            # Format the plan for the scorer
+            steps_summary = []
+            for step in plan["steps"]:
+                deps = step.get("dependencies", [])
+                criteria_count = len(step.get("acceptance_criteria", []))
+                steps_summary.append(
+                    f"    - `{step['step_id']}`: {step['title']} "
+                    f"[{step.get('estimated_complexity', '?')}] "
+                    f"(deps: {deps or 'none'}, criteria: {criteria_count}, "
+                    f"parallel: {step.get('can_run_in_parallel', False)}, "
+                    f"max_attempts: {step.get('max_attempts', 3)})"
+                )
+
+            formatted_plan = (
+                f"### Plan Candidate — {label}\n"
+                f"**Directive**: {candidate_ref['directive']}\n"
+                f"**Steps**: {candidate_ref['steps_count']}\n"
+                f"**Step Details**:\n" + "\n".join(steps_summary) + "\n"
+                f"\n**Full Plan JSON**:\n```json\n{json.dumps(plan, indent=2)}\n```\n"
             )
 
-        parts.append(
-            f"### Candidate {i} — {c['directive_label']}\n"
-            f"**Directive**: {c['directive']}\n"
-            f"**Steps**: {c['steps_count']}\n"
-            f"**Step Details**:\n" + "\n".join(steps_summary) + "\n"
-            f"\n**Full Plan JSON**:\n```json\n{json.dumps(plan, indent=2)}\n```\n"
-        )
+            user_prompt = f"## Task Objective\n{task_description}\n\n{formatted_plan}\n\nEvaluate this plan."
 
-    return "\n---\n".join(parts)
+            llm = get_llm("plan_judge")
+            response = llm.invoke([
+                SystemMessage(content=PLAN_SCORER_SYSTEM_PROMPT),
+                HumanMessage(content=user_prompt),
+            ])
+
+            raw = _normalize_llm_content(response.content).strip()
+            json_str = _extract_json_from_response(raw)
+            evaluation = json.loads(json_str)
+
+            evaluation["candidate_index"] = candidate_index
+            evaluation["directive_label"] = label
+            return evaluation
+
+        except Exception as e:
+            if attempt == 0:
+                print(f"  ⚠️  RETRY: Scorer for Candidate {candidate_index} ({label}) failed: {str(e)[:150]}", flush=True)
+                time.sleep(3)  # brief backoff before retry
+            else:
+                print(f"  ❌ FAILED: Scorer for Candidate {candidate_index} ({label}) failed after retry: {str(e)[:150]}", flush=True)
+
+    return None
 
 
 def _judge_plans(
-    candidates: List[Dict],
+    candidate_refs: List[Dict],
     task_description: str,
 ) -> Dict:
     """
-    Evaluate all candidates and select the best one.
-    Returns the full judge evaluation including scores and reasoning.
+    Evaluate all candidates in parallel and select the best one via aggregation.
+    
+    candidate_refs are metadata-only dicts (no plan key). Plans are loaded from
+    disk on demand by each scorer thread.
     """
-    if len(candidates) == 1:
-        # Only one valid candidate — auto-select
+    if len(candidate_refs) == 1:
         return {
             "evaluations": [{
                 "candidate_index": 0,
@@ -463,76 +540,135 @@ def _judge_plans(
             "escalation_reason": "Only one valid candidate was generated."
         }
 
+    n = len(candidate_refs)
     print(f"\n{'─' * 60}", flush=True)
-    print(f"PLAN JUDGE: Evaluating {len(candidates)} candidates...", flush=True)
+    print(f"PLAN SCORER: Evaluating {n} candidates in PARALLEL...", flush=True)
     print(f"{'─' * 60}", flush=True)
 
-    formatted = _format_candidates_for_judge(candidates)
-    user_prompt = PLAN_JUDGE_USER_PROMPT.format(
-        task_description=task_description,
-        formatted_candidates=formatted,
+    scores = [None] * n
+    failed_indices = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+        future_to_idx = {
+            executor.submit(_score_single_plan, i, ref, task_description): i
+            for i, ref in enumerate(candidate_refs)
+        }
+        for future in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+                if result:
+                    scores[idx] = result
+                    print(f"  ✅ Candidate {idx} ({candidate_refs[idx]['directive_label']}): "
+                          f"{result.get('total_score', '?')}/60", flush=True)
+                else:
+                    failed_indices.append(idx)
+            except Exception as e:
+                print(f"  ❌ Candidate {idx}: Scoring exception: {str(e)[:150]}", flush=True)
+                failed_indices.append(idx)
+
+    # ── Summary ──
+    valid_scores = [s for s in scores if s is not None]
+    print(f"\n  SCORING SUMMARY: {len(valid_scores)}/{n} scored, "
+          f"{len(failed_indices)} failed", flush=True)
+    if failed_indices:
+        failed_labels = [f"{i} ({candidate_refs[i]['directive_label']})" for i in failed_indices]
+        print(f"  FAILED CANDIDATES: {', '.join(failed_labels)}", flush=True)
+
+    if not valid_scores:
+        print("  ⚠️  All scorers failed. Defaulting to first candidate.", flush=True)
+        return {
+            "evaluations": [],
+            "selected_index": 0,
+            "selection_reasoning": "All scores failed — defaulted to first.",
+            "margin": 0,
+            "risk_level": "medium",
+            "escalation_recommended": True,
+            "escalation_reason": "Scoring failed for all candidates."
+        }
+
+    # ── Index Remapping ──
+    # Aggregator sees contiguous indices 0..len(valid_scores)-1
+    # We maintain a map back to original candidate indices
+    remap = []  # remap[contiguous_idx] = original_candidate_idx
+    agg_parts = []
+    for contiguous_idx, s in enumerate(valid_scores):
+        orig_idx = s["candidate_index"]
+        remap.append(orig_idx)
+        agg_parts.append(
+            f"### Candidate {contiguous_idx}: {candidate_refs[orig_idx]['directive_label']}\n"
+            f"- Total Score: {s.get('total_score', '?')}/60\n"
+            f"- Dimension Scores: {json.dumps(s.get('scores', {}))}\n"
+            f"- Strengths: {', '.join(s.get('strengths', []))}\n"
+            f"- Weaknesses: {', '.join(s.get('weaknesses', []))}\n"
+        )
+
+    # Add explicit failure markers so aggregator knows the full picture
+    if failed_indices:
+        failure_section = "\n## Candidates That Failed Scoring\n\n"
+        for fi in failed_indices:
+            failure_section += (
+                f"- **Candidate {candidate_refs[fi]['directive_label']}** "
+                f"[SCORING FAILED — not eligible for selection]\n"
+            )
+        agg_parts.append(failure_section)
+
+    print(f"\nPLAN AGGREGATOR: Selecting best plan from {len(valid_scores)} evaluations "
+          f"({len(failed_indices)} excluded)...", flush=True)
+
+    agg_user_prompt = (
+        f"## Task Objective\n{task_description}\n\n"
+        f"## Candidate Evaluations ({len(valid_scores)} of {n} candidates scored)\n\n"
+        + "\n---\n".join(agg_parts)
+        + f"\n\nCompare the scored evaluations and select the best candidate. "
+        f"Return selected_index as a 0-based index into the scored candidates above "
+        f"(0 to {len(valid_scores) - 1})."
     )
 
     llm = get_llm("plan_judge")
     start = time.time()
 
-    # Retry wrapper for transient network errors
-    MAX_RETRIES = 3
-    RETRY_DELAYS = [5, 10, 20]  # shorter backoff for judge
-    response = None
-
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            response = llm.invoke([
-                SystemMessage(content=PLAN_JUDGE_SYSTEM_PROMPT),
-                HumanMessage(content=user_prompt),
-            ])
-            break  # success
-        except Exception as e:
-            error_name = type(e).__name__
-            is_transient = any(keyword in error_name for keyword in [
-                "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
-                "RemoteDisconnected", "ConnectionReset"
-            ]) or "timed out" in str(e).lower()
-
-            if is_transient and attempt < MAX_RETRIES:
-                delay = RETRY_DELAYS[attempt]
-                print(f"⚠️  Transient error ({error_name}) in judge, retrying in {delay}s... (attempt {attempt + 1}/{MAX_RETRIES})", flush=True)
-                time.sleep(delay)
-                continue
-            else:
-                print(f"DEBUG: FATAL ERROR in plan judge: {str(e)}", flush=True)
-                raise e
+    response = llm.invoke([
+        SystemMessage(content=PLAN_AGGREGATOR_SYSTEM_PROMPT),
+        HumanMessage(content=agg_user_prompt),
+    ])
 
     raw = _normalize_llm_content(response.content).strip()
-    elapsed = time.time() - start
-
-    # Robustly extract JSON from the response
     json_str = _extract_json_from_response(raw)
 
     try:
-        evaluation = json.loads(json_str)
-    except json.JSONDecodeError:
-        print(f"  ⚠️  Judge returned invalid JSON. Falling back to candidate 0.", flush=True)
+        final_decision = json.loads(json_str)
+        final_decision["evaluations"] = valid_scores
+
+        # Remap contiguous index → original candidate index
+        contiguous_selected = final_decision.get("selected_index", 0)
+        if contiguous_selected >= len(remap):
+            contiguous_selected = 0
+        original_selected = remap[contiguous_selected]
+        final_decision["selected_index"] = original_selected
+
+        risk = final_decision.get("risk_level", "medium")
+        margin = final_decision.get("margin", 0)
+
+        print(f"  JUDGE: Selected candidate {original_selected} "
+              f"({candidate_refs[original_selected]['directive_label']})", flush=True)
+        print(f"  JUDGE: Margin: {margin}, Risk: {risk} ({time.time() - start:.1f}s)", flush=True)
+        print(f"  JUDGE: Reasoning: {final_decision.get('selection_reasoning', 'N/A')[:200]}", flush=True)
+
+        return final_decision
+
+    except Exception as e:
+        print(f"  ⚠️  Aggregator failed: {str(e)}. Defaulting to highest score.", flush=True)
+        valid_scores.sort(key=lambda x: x.get("total_score", 0), reverse=True)
+        winner = valid_scores[0]
         return {
-            "evaluations": [],
-            "selected_index": 0,
-            "selection_reasoning": "Judge returned unparseable output — defaulted to first candidate.",
+            "evaluations": valid_scores,
+            "selected_index": winner["candidate_index"],
+            "selection_reasoning": "Aggregator failed; selected via highest score.",
             "margin": 0,
             "risk_level": "medium",
-            "escalation_recommended": True,
-            "escalation_reason": "Judge evaluation failed."
+            "escalation_recommended": True
         }
-
-    selected = evaluation.get("selected_index", 0)
-    margin = evaluation.get("margin", 0)
-    risk = evaluation.get("risk_level", "medium")
-
-    print(f"  JUDGE: Selected candidate {selected} ({candidates[selected]['directive_label']})", flush=True)
-    print(f"  JUDGE: Margin: {margin}, Risk: {risk} ({elapsed:.1f}s)", flush=True)
-    print(f"  JUDGE: Reasoning: {evaluation.get('selection_reasoning', 'N/A')[:200]}", flush=True)
-
-    return evaluation
 
 
 # ────────────────────────────────────────────────────────────
@@ -778,8 +914,20 @@ def planner_node(state: AgentState) -> dict:
         historical_context=historical_context,
     )
 
+    planner_system_prompt = PLANNER_SYSTEM_PROMPT
+    if "PREVIOUS FAILURE DETECTED" in rollback_context:
+        planner_system_prompt += (
+            f"\n\n{'!' * 60}\n"
+            f"## CRITICAL: FAILURE RECOVERY MODE\n"
+            f"A previous attempt to solve this task FAILED and triggered a ROLLBACK.\n"
+            f"You MUST read the ROLLBACK / FAILURE CONTEXT below carefully.\n"
+            f"Your previous strategy was rejected by the Reflector. DO NOT repeat it.\n"
+            f"Identify exactly what went wrong and pivot to a more robust architectural approach.\n"
+            f"{'!' * 60}\n"
+        )
+
     planning_messages = [
-        SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+        SystemMessage(content=planner_system_prompt),
         HumanMessage(content=user_prompt),
     ]
 
@@ -877,6 +1025,12 @@ def planner_node(state: AgentState) -> dict:
     if not candidates:
         raise ValueError("No valid plan candidates were generated. All generation attempts failed.")
 
+    # ─── Persist candidates to disk (memory optimization) ───
+    task_dir = Path(workspace.task_directory_rel) if workspace else Path(".")
+    candidate_refs = _persist_candidates_to_disk(task_dir, candidates)
+    # From this point, 'candidates' (with full plans) can be GC'd
+    del candidates
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PHASE 3: JUDGE & SELECT
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -885,13 +1039,13 @@ def planner_node(state: AgentState) -> dict:
     print(f"PLANNER PHASE 3: Plan Evaluation & Selection", flush=True)
     print(f"{'=' * 60}", flush=True)
 
-    evaluation = _judge_plans(candidates, task_description)
+    evaluation = _judge_plans(candidate_refs, task_description)
 
     # ─── Adaptive Escalation ───
-    if _should_escalate(evaluation, len(candidates)):
+    if _should_escalate(evaluation, len(candidate_refs)):
         reason = evaluation.get("escalation_reason", "Margin too thin or scores too low")
         print(f"\n🔄 ESCALATION TRIGGERED: {reason}", flush=True)
-        escalation_history.append(f"Round 1: {len(candidates)} candidates, escalating because: {reason}")
+        escalation_history.append(f"Round 1: {len(candidate_refs)} candidates, escalating because: {reason}")
 
         # Generate ONLY the 2 new escalation directives (indices 3-4)
         escalation_directives = PLAN_GENERATION_DIRECTIVES[DEFAULT_CANDIDATE_COUNT:ESCALATED_CANDIDATE_COUNT]
@@ -908,41 +1062,48 @@ def planner_node(state: AgentState) -> dict:
             task_directory_rel=ws_task_dir_rel,
         )
 
-        # Append new candidates
-        candidates.extend(extra)
+        # Persist new candidates and extend refs
+        extra_refs = _persist_candidates_to_disk(task_dir, extra, start_index=len(candidate_refs))
+        candidate_refs.extend(extra_refs)
+        del extra
 
-        print(f"DEBUG: After escalation: {len(candidates)} total candidates", flush=True)
-        escalation_history.append(f"Round 2: {len(candidates)} total candidates after escalation")
+        print(f"DEBUG: After escalation: {len(candidate_refs)} total candidates", flush=True)
+        escalation_history.append(f"Round 2: {len(candidate_refs)} total candidates after escalation")
 
         # Re-judge with all candidates
-        evaluation = _judge_plans(candidates, task_description)
+        evaluation = _judge_plans(candidate_refs, task_description)
 
-    # ─── Extract winner ───
+    # ─── Extract winner (load plan from disk) ───
     selected_idx = evaluation.get("selected_index", 0)
-    if selected_idx >= len(candidates):
+    if selected_idx >= len(candidate_refs):
         selected_idx = 0
-    winner = candidates[selected_idx]
-    result = winner["plan"]
+    winner_ref = candidate_refs[selected_idx]
+    result = _load_candidate_plan(winner_ref["plan_path"])
 
-    print(f"\n🏆 WINNER: {winner['directive_label']} ({winner['steps_count']} steps)", flush=True)
+    print(f"\n🏆 WINNER: {winner_ref['directive_label']} ({winner_ref['steps_count']} steps)", flush=True)
 
     # ─── Convert to PlanSteps ───
     plan_steps = []
     for step in result["steps"]:
-        plan_step: PlanStep = {
-            "step_id": step.get("step_id"),
-            "title": step.get("title"),
-            "description": step.get("description"),
-            "acceptance_criteria": step.get("acceptance_criteria", []),
-            "max_attempts": step.get("max_attempts", 3),
-            "estimated_complexity": step.get("estimated_complexity", "medium"),
-            "dependencies": step.get("dependencies", []),
-            "status": "pending",
-            "uses_skills": step.get("uses_skills", []),
-            "skill_instructions": step.get("skill_instructions"),
-            "can_run_in_parallel": step.get("can_run_in_parallel", False),
-            "current_attempt": 1
-        }
+        step_id = step.get("step_id", "unknown")
+        # Bind step to workspace
+        step_ws = workspace.for_step(step_id) if workspace else None
+        plan_step = PlanStep(
+            step_id=step_id,
+            title=step.get("title", "Untitled"),
+            description=step.get("description", ""),
+            acceptance_criteria=step.get("acceptance_criteria", []),
+            max_attempts=step.get("max_attempts", 3),
+            estimated_complexity=step.get("estimated_complexity", "medium"),
+            dependencies=step.get("dependencies", []),
+            status="pending",
+            uses_skills=step.get("uses_skills", []),
+            skill_instructions=step.get("skill_instructions"),
+            can_run_in_parallel=step.get("can_run_in_parallel", False),
+            step_workspace=step_ws,
+        )
+        # Create initial attempt (attempt 1)
+        plan_step.new_attempt()
         plan_steps.append(plan_step)
 
     plan_steps = _enforce_systems_depth_requirements(task_description, plan_steps)
@@ -961,7 +1122,7 @@ def planner_node(state: AgentState) -> dict:
     needs_approval, approval_reason = _needs_approval(evaluation, plan_steps)
 
     if needs_approval:
-        summary = _format_approval_summary(evaluation, candidates, plan_steps)
+        summary = _format_approval_summary(evaluation, candidate_refs, plan_steps)
         print(summary, flush=True)
         print(f"\n⚠️  Approval required: {approval_reason}", flush=True)
         print("   Auto-proceeding with winning plan (HITL not yet wired).", flush=True)
@@ -970,21 +1131,26 @@ def planner_node(state: AgentState) -> dict:
 
     # ─── Persist everything ───
     if workspace:
-        task_dir = Path(workspace.task_directory_rel)
-
         # Save plan_candidates.json (audit trail)
-        _persist_candidates(task_dir, candidates, evaluation, escalation_history)
+        # Re-load full candidates for the audit file
+        full_candidates = []
+        for ref in candidate_refs:
+            plan = _load_candidate_plan(ref["plan_path"])
+            full_candidates.append({**ref, "plan": plan})
+        _persist_candidates(task_dir, full_candidates, evaluation, escalation_history)
 
         # Save winning plan as plan.json
         plan_rel_path = workspace.get_path("plan_path")
         plan_path = task_dir / plan_rel_path
+        # Serialize PlanStep models to dicts for JSON persistence
+        steps_dicts = [s.model_dump(exclude={"step_workspace", "attempts"}) for s in plan_steps]
         plan_data = {
             "task_id": result["task_id"],
             "task_directory_rel": result["task_directory_rel"],
-            "steps": plan_steps,
+            "steps": steps_dicts,
             "selected_from": {
-                "directive": winner["directive"],
-                "candidate_count": len(candidates),
+                "directive": winner_ref["directive"],
+                "candidate_count": len(candidate_refs),
                 "judge_score": evaluation.get("evaluations", [{}])[selected_idx].get("total_score", "N/A")
                     if evaluation.get("evaluations") and selected_idx < len(evaluation.get("evaluations", []))
                     else "N/A",
@@ -1002,8 +1168,8 @@ def planner_node(state: AgentState) -> dict:
     total_duration = time.time() - start_time
     print(f"\n{'=' * 60}", flush=True)
     print(f"PLANNER: Complete! Total time: {total_duration:.1f}s", flush=True)
-    print(f"  Candidates generated: {len(candidates)}", flush=True)
-    print(f"  Winner: {winner['directive_label']}", flush=True)
+    print(f"  Candidates generated: {len(candidate_refs)}", flush=True)
+    print(f"  Winner: {winner_ref['directive_label']}", flush=True)
     print(f"  Escalated: {'Yes' if escalation_history else 'No'}", flush=True)
     print(f"{'=' * 60}", flush=True)
 
@@ -1012,8 +1178,8 @@ def planner_node(state: AgentState) -> dict:
         "current_step_index": 0,
         "phase": "executing",
         "progress_reports": [
-            f"Plan selected: {winner['directive_label']} ({winner['steps_count']} steps)",
-            f"Candidates evaluated: {len(candidates)}",
+            f"Plan selected: {winner_ref['directive_label']} ({winner_ref['steps_count']} steps)",
+            f"Candidates evaluated: {len(candidate_refs)}",
             f"Escalated: {'Yes' if escalation_history else 'No'}",
         ]
     }

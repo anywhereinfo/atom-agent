@@ -57,6 +57,11 @@ SCORING LOGIC (DETERMINISTIC)
     - pass_rate >= 0.80 → cap 0.79
     - 0.50–0.79 → cap 0.59
     - <0.50 → cap 0.49
+
+SPECIFIC RESOLUTIONS:
+- **ModuleNotFoundError: autogen** → This is a version mismatch (v0.2 vs v0.4+).
+  - INSTRUCTION: "Upgrade code to use `autogen_agentchat` or use the project shim `from atom_agent.lib import autogen`."
+
 - Attempt handling:
     - If attempt_number >= 3 → bias toward rollback unless trivial fix.
     - If attempt_number >= max_attempts - 1 → strongly bias rollback.

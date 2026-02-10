@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from pathlib import Path
 
 class Workspace(BaseModel):
@@ -46,7 +46,84 @@ class Workspace(BaseModel):
         """Returns the relative task directory as a Path object."""
         return Path(self.task_directory_rel)
 
+    def for_step(self, step_id: str) -> "StepWorkspace":
+        """Factory: create a StepWorkspace bound to this workspace and step."""
+        return StepWorkspace(step_id=step_id, _workspace=self)
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Workspace":
         """Factory to create a Workspace instance from a dictionary (e.g. from JSON)."""
         return cls(**data)
+
+
+class StepWorkspace(BaseModel):
+    """
+    A thin workspace wrapper scoped to a specific step.
+    Delegates all path resolution to the parent Workspace.
+    """
+    step_id: str
+    _workspace: Workspace
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def __init__(self, step_id: str, _workspace: Workspace, **kwargs):
+        super().__init__(step_id=step_id, **kwargs)
+        # Store as private attr (not a Pydantic field, avoids serialization)
+        object.__setattr__(self, '_workspace', _workspace)
+
+    def get_step_dir(self) -> str:
+        """Resolve the step-level directory path."""
+        return self._workspace.get_path("step_dir", step_id=self.step_id)
+
+    def get_messages_dir(self) -> str:
+        """Resolve the step-level messages directory."""
+        return self._workspace.get_path("step_messages_dir", step_id=self.step_id)
+
+    def get_committed_dir(self) -> str:
+        """Resolve the committed output directory for this step."""
+        return self._workspace.get_path("committed_dir", step_id=self.step_id)
+
+    def for_attempt(self, attempt_id: str) -> "AttemptWorkspace":
+        """Factory: create an AttemptWorkspace bound to this step."""
+        return AttemptWorkspace(
+            step_id=self.step_id,
+            attempt_id=attempt_id,
+            _workspace=self._workspace,
+        )
+
+
+class AttemptWorkspace(BaseModel):
+    """
+    A thin workspace wrapper scoped to a specific step + attempt.
+    Delegates all path resolution to the parent Workspace.
+    """
+    step_id: str
+    attempt_id: str
+    _workspace: Workspace
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def __init__(self, step_id: str, attempt_id: str, _workspace: Workspace, **kwargs):
+        super().__init__(step_id=step_id, attempt_id=attempt_id, **kwargs)
+        object.__setattr__(self, '_workspace', _workspace)
+
+    def get_staging_paths(self) -> Dict[str, str]:
+        """Get all staging paths for this attempt. Delegates to Workspace."""
+        return self._workspace.get_staging_paths(self.step_id, self.attempt_id)
+
+    def get_impl_path(self) -> str:
+        return self._workspace.get_path("attempt_impl", step_id=self.step_id, attempt_id=self.attempt_id)
+
+    def get_test_path(self) -> str:
+        return self._workspace.get_path("attempt_test", step_id=self.step_id, attempt_id=self.attempt_id)
+
+    def get_artifacts_dir(self) -> str:
+        return self._workspace.get_path("attempt_artifacts_dir", step_id=self.step_id, attempt_id=self.attempt_id)
+
+    def get_attempt_dir(self) -> str:
+        return self._workspace.get_path("attempt_dir", step_id=self.step_id, attempt_id=self.attempt_id)
+
+    def get_report_path(self, task_dir_rel: str) -> Path:
+        """Resolve the report.json path for this attempt."""
+        attempt_dir = self._workspace.get_path("attempt_dir", step_id=self.step_id, attempt_id=self.attempt_id)
+        return Path(task_dir_rel) / attempt_dir / "report.json"

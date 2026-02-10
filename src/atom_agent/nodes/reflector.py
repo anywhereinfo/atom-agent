@@ -19,8 +19,9 @@ def _run_programmatic_prechecks(task_dir_rel: str, staging_paths: dict, current_
     warnings = []
     artifacts_dir = Path(task_dir_rel) / staging_paths.get("artifacts_dir", "")
     step_id = current_step.get("step_id", "unknown")
-    attempt_num = current_step.get("current_attempt", 1)
-    attempt_id = f"a{attempt_num:02d}"
+    attempt = current_step.current_attempt() if hasattr(current_step, 'current_attempt') else None
+    attempt_num = attempt.attempt_number if attempt else current_step.get("current_attempt", 1)
+    attempt_id = attempt.attempt_id if attempt else f"a{attempt_num:02d}"
 
     # --- CHECK 1: Hardcoded output in impl.py ---
     impl_path = Path(task_dir_rel) / staging_paths.get("impl", "")
@@ -106,10 +107,17 @@ def reflector_node(state: AgentState) -> Dict[str, Any]:
     current_step = plan[current_step_idx]
     
     step_id = current_step.get("step_id", "unknown")
-    attempt_num = current_step.get("current_attempt", 1)
-    attempt_id = f"a{attempt_num:02d}"
+    attempt = current_step.current_attempt() if hasattr(current_step, 'current_attempt') else None
+    attempt_num = attempt.attempt_number if attempt else current_step.get("current_attempt", 1)
+    attempt_id = attempt.attempt_id if attempt else f"a{attempt_num:02d}"
     
-    staging_paths = workspace.get_staging_paths(step_id, attempt_id) if workspace else {}
+    # Resolve staging paths via attempt workspace
+    if attempt and attempt.workspace:
+        staging_paths = attempt.workspace.get_staging_paths()
+    elif workspace:
+        staging_paths = workspace.get_staging_paths(step_id, attempt_id)
+    else:
+        staging_paths = {}
     errors_dir_abs = Path(task_dir_rel) / staging_paths.get("errors_dir", "")
     artifacts_dir_abs = Path(task_dir_rel) / staging_paths.get("artifacts_dir", "")
     
@@ -269,8 +277,11 @@ def reflector_node(state: AgentState) -> Dict[str, Any]:
     # --- 4. PERSISTENCE & STATE UPDATE ---
     
     # Save review to report.json in the attempt directory
-    attempt_dir_rel = workspace.get_path("attempt_dir", step_id=step_id, attempt_id=attempt_id) if workspace else f"steps/{step_id}/attempts/{attempt_id}/"
-    report_path = Path(task_dir_rel) / attempt_dir_rel / "report.json"
+    if attempt and attempt.workspace:
+        report_path = attempt.workspace.get_report_path(task_dir_rel)
+    else:
+        attempt_dir_rel = workspace.get_path("attempt_dir", step_id=step_id, attempt_id=attempt_id) if workspace else f"steps/{step_id}/attempts/{attempt_id}/"
+        report_path = Path(task_dir_rel) / attempt_dir_rel / "report.json"
     
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,14 +291,30 @@ def reflector_node(state: AgentState) -> Dict[str, Any]:
         print(f"DEBUG: Failed to save report.json: {e}", flush=True)
 
     # State update
-    if review.get("decision") == "proceed":
-        current_step["status"] = "accepted" # Accepted by reflector, but not yet committed
-    elif review.get("decision") == "rollback":
+    decision = review.get("decision")
+    if decision == "proceed":
+        current_step["status"] = "accepted"
+        if attempt:
+            attempt.status = "accepted"
+            attempt.decision = "proceed"
+            attempt.confidence_score = review.get("confidence_score")
+    elif decision == "rollback":
         current_step["status"] = "failed"
+        if attempt:
+            attempt.status = "failed"
+            attempt.decision = "rollback"
+            attempt.confidence_score = review.get("confidence_score")
     else:
         current_step["status"] = "refined"
-        # Increment attempt for NEXT run
-        current_step["current_attempt"] = attempt_num + 1
+        if attempt:
+            attempt.status = "refined"
+            attempt.decision = "refine"
+            attempt.confidence_score = review.get("confidence_score")
+        # Create next attempt
+        if hasattr(current_step, 'new_attempt'):
+            current_step.new_attempt()
+        else:
+            current_step["current_attempt"] = attempt_num + 1
 
     return {
         "implementation_plan": plan,

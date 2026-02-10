@@ -109,6 +109,26 @@ At minimum, include:
 ────────────────────────────────────────────────────────────
 ## FAILURE & BLOCKING RULES
 
+────────────────────────────────────────────────────────────
+## MODERN LIBRARY AWARENESS (CRITICAL)
+
+Many agentic libraries have undergone major API shifts. You MUST follow these modern patterns:
+
+- **Microsoft AutoGen**:
+  - Legacy (v0.2): `import autogen`, `ConversableAgent`, `UserProxyAgent`.
+  - Modern (v0.4+): Use `autogen_agentchat` and `autogen_core`.
+  - IF working in this environment, try to use version-agnostic code or specific v0.4 imports.
+  - A project shim is provided: if `import autogen` fails, try `from atom_agent.lib import autogen`.
+
+- **LangGraph**:
+  - Use `langgraph.graph` for MessageGraph/StateGraph.
+  - Use `langgraph.prebuilt` for standard ReAct agents.
+
+- **CrewAI**:
+  - Use `from crewai import Agent, Task, Crew`.
+
+Before implementing, use `execute_python_code` to check `pip list` or `import <package>; print(<package>.__version__)` if you are unsure of the environment capabilities.
+
 You MUST FAIL (and explain clearly) if:
 - Required dependencies are missing from committed/
 - The plan asks you to write outside your attempt directory

@@ -22,8 +22,9 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
 
     current_step = plan[current_step_idx]
     step_id = current_step.get("step_id", "unknown")
-    attempt_num = current_step.get("current_attempt", 1)
-    attempt_id = f"a{attempt_num:02d}"
+    attempt = current_step.current_attempt() if hasattr(current_step, 'current_attempt') else None
+    attempt_num = attempt.attempt_number if attempt else current_step.get("current_attempt", 1)
+    attempt_id = attempt.attempt_id if attempt else f"a{attempt_num:02d}"
     
     # Check if we should actually commit
     review = state.get("reflector_review", {})
@@ -34,12 +35,20 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
     task_dir = Path(workspace.task_directory_rel)
 
     # Source: Attempt staging - use workspace contract
-    staging_paths = workspace.get_staging_paths(step_id, attempt_id)
+    if attempt and attempt.workspace:
+        staging_paths = attempt.workspace.get_staging_paths()
+    else:
+        staging_paths = workspace.get_staging_paths(step_id, attempt_id)
+
     attempt_dir_rel = workspace.get_path("attempt_dir", step_id=step_id, attempt_id=attempt_id)
     attempt_dir = task_dir / attempt_dir_rel
 
-    # Destination: Committed - use workspace contract
-    committed_dir_rel = workspace.get_path("committed_dir", step_id=step_id)
+    # Destination: Committed - use step workspace
+    step_ws = current_step.step_workspace if hasattr(current_step, 'step_workspace') else None
+    if step_ws:
+        committed_dir_rel = step_ws.get_committed_dir()
+    else:
+        committed_dir_rel = workspace.get_path("committed_dir", step_id=step_id)
     committed_dir = task_dir / committed_dir_rel
     
     print(f"DEBUG COMMIT: Promoting {attempt_id} to committed for step {step_id}", flush=True)
