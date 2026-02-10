@@ -3,9 +3,11 @@ from typing import Dict, Any
 import time
 
 # Centralized Model Configuration
+# Pro: deep reasoning (planning, judging, reflection)
+# Flash: fast execution (candidate generation, code implementation)
 MODEL_CONFIG = {
     "planner": {
-        "model": "gemini-3-flash-preview",
+        "model": "gemini-3-pro-preview",
         "temperature": 0.1,
     },
     "plan_generator": {
@@ -13,7 +15,7 @@ MODEL_CONFIG = {
         "temperature": 0.7,
     },
     "plan_judge": {
-        "model": "gemini-3-flash-preview",
+        "model": "gemini-3-pro-preview",
         "temperature": 0.0,
     },
     "executor": {
@@ -21,7 +23,7 @@ MODEL_CONFIG = {
         "temperature": 0.4,
     },
     "reflector": {
-        "model": "gemini-3-flash-preview",
+        "model": "gemini-3-pro-preview",
         "temperature": 0.1,
     }
 }
@@ -79,5 +81,5 @@ def get_llm(component_name: str) -> ChatGoogleGenerativeAI:
         model=config["model"],
         temperature=config["temperature"],
         max_retries=6,
-        request_timeout=240
+        request_timeout=600
     )

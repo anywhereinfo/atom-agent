@@ -12,6 +12,7 @@ The flow is:
 ### `EXECUTOR_SYSTEM_PROMPT`
 -   **Role**: "Lead Executor... responsible for implementing ONE step."
 -   **Authoritative Inputs**: Defines `state/plan.json` as the Single Source of Truth.
+-   **Anti-Hardcoded-Output Rules**: Mandatory rules forbidding large string literals in `impl.py` or mocking results unless explicitly asked.
 -   **Workspace Rules**:
     -   Must write ONLY to `steps/{step_id}/attempts/{attempt_id}/`.
     -   Must NOT use `..` to escape.
@@ -21,6 +22,7 @@ The flow is:
 
 ### `EXECUTOR_USER_PROMPT`
 -   **Step Context**: `{step_id}`, `{step_title}`, `{step_description}`, `{acceptance_criteria}`.
+-   **Dependency Context**: `{dependency_context}` provides paths to committed artifacts from all required parent steps.
 -   **Staging Targets**: Explicit paths for `impl.py` and `test.py` (e.g., `steps/login/attempts/a01/impl.py`).
 -   **Mandatory Testing**: Explicit instruction to run `run_pytest` and create `test_results.json`.
 

@@ -15,8 +15,9 @@ The flow is:
 5.  **Plan Extraction**:
     -   Parses the agent's messages to find the valid `submit_plan` tool call.
     -   Validates the plan structure.
-6.  **Persistence**:
+6.  **Persistence & Enforcement**:
     -   Converts the plan dictionary to `PlanStep` typed objects.
+    -   **Complexity Ceiling Enforcement**: Automatically downgrades any step with `estimated_complexity: "high"` to `"medium"` with a warning log, enforcing decomposition at the architectural level.
     -   Enforces any additional criteria (e.g., specific evaluation metrics).
     -   Saves the plan to `state/plan.json`.
 7.  **State Update**: Returns the initial plan and sets phase to `executing`.
@@ -30,6 +31,7 @@ The flow is:
 -   **Agent Fails to Submit**: Raises `ValueError` if the agent converses but never calls `submit_plan`.
 -   **Rollback**: Clears legacy steps to prevent "Ghost Context" when restarting a failed task sections.
 -   **Systems Evaluation**: Has special logic (`_is_systems_evaluation_task`) to inject rigorous academic criteria into the plan automatically.
+-   **Complexity Ceiling**: If a task naturally requires HIGH complexity, the planner is instructed to decompose it into multiple MEDIUM/LOW steps. Programmatic enforcement ensures no HIGH steps enter the execution phase.
 
 ## Method Documentation
 

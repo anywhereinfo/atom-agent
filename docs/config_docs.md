@@ -18,8 +18,9 @@ The flow is simple:
 ## Method Documentation
 
 ### `MODEL_CONFIG` (Variable)
-A dictionary mapping component names ("planner", "executor", "reflector") to their configuration:
--   `model`: The specific Gemini model string (e.g., "gemini-1.5-pro-preview-0409").
+A dictionary mapping component names to their configuration:
+-   **Reasoning Tier** (`planner`, `plan_judge`, `reflector`): Uses `gemini-3-pro-preview` for deep analysis and architectural decision-making.
+-   **Execution Tier** (`plan_generator`, `executor`): Uses `gemini-3-flash-preview` for speed and implementation tasks.
 -   `temperature`: Creativity setting (0.0 - 1.0).
 
 ### `get_llm(component_name: str) -> ChatGoogleGenerativeAI`

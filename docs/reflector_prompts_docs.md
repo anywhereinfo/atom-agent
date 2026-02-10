@@ -15,13 +15,17 @@ The flow is:
     -   Output ONLY valid JSON.
     -   Evaluate *every* acceptance criterion.
     -   Use objective evidence (test results, artifacts).
--   **Scoring Logic**: Defines deterministic caps (e.g., if tests fail, confidence cap = 0.49).
+-   **Scoring Logic**: Defines deterministic caps:
+    -   Tests failed: 0.49 cap.
+    -   Hardcoded implementation detected: 0.49 cap.
+    -   Existence-only tests or missing dependencies: 0.59 cap.
 -   **Routing Contract**: Explicitly defines when to `proceed` (>= 0.70), `refine`, or `rollback`.
 
 ### `REFLECTOR_USER_PROMPT`
 -   **Dynamic Fields**:
     -   `{step_id}`, `{step_title}`, `{step_description}`: Step context.
     -   `{acceptance_criteria}`: The rubric to check against.
+    -   `{programmatic_warnings}`: Machine-level red flags from `_run_programmatic_prechecks`.
     -   `{test_results_summary}`: The output from `run_pytest` or `execute_python_code`.
     -   `{artifacts_summary}`: List of created files.
     -   `{execution_summary}`: Narrative of what the executor did.

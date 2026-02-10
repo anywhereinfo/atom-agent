@@ -14,9 +14,8 @@ The flow is:
 -   **Workflow**:
     -   **Phase 0 (Research)**: Mandates using `tavily_search` and `arxiv_search` before planning.
     -   **Phase 3 (Submission)**: Requires calling `submit_plan` with a valid JSON.
--   **Systems-Level Depth**: for evaluation tasks, it *forces* the agent to include analysis of:
-    -   Topology, Control Models, Complexity (Big O), Failure Modes, Determinism.
--   **Output Format**: Provides the exact JSON schema for `submit_plan`.
+-   **Complexity Ceiling**: Mandatory rule—no step may have `estimated_complexity: "high"`. HIGH steps MUST be decomposed into multiple sequential MEDIUM/LOW steps.
+-   **Output Format**: Provides the exact JSON schema for `submit_plan` (only allows "low" or "medium" for complexity).
 
 ### `PLANNER_USER_PROMPT`
 -   **Inputs**:

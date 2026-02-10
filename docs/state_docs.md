@@ -26,7 +26,7 @@ Represents a single step in the execution plan.
     -   `description`: Detailed description.
     -   `acceptance_criteria`: List of criteria for success.
     -   `max_attempts`: Retry limit.
-    -   `estimated_complexity`: low/medium/high.
+    -   `estimated_complexity`: low/medium (high is forbidden).
     -   `dependencies`: List of step IDs this step depends on.
     -   `status`: Current status (pending, in_progress, completed, failed, refined, blocked).
     -   `uses_skills`: Skills required.

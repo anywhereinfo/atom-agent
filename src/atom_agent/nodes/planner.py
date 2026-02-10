@@ -788,16 +788,36 @@ def planner_node(state: AgentState) -> dict:
     start_time = time.time()
     print("DEBUG: Invoking agentic planner for research...", flush=True)
 
-    try:
-        agent_result = planner_agent.invoke(
-            {"messages": planning_messages},
-            config={"callbacks": [DebugCallbackHandler()]}
-        )
-        phase1_duration = time.time() - start_time
-        print(f"\nDEBUG: Phase 1 (research) completed in {phase1_duration:.1f}s", flush=True)
-    except Exception as e:
-        print(f"DEBUG: Agentic planner FAILED: {str(e)}", flush=True)
-        raise e
+    # Retry wrapper for Phase 1 Research
+    MAX_RETRIES = 2
+    RETRY_DELAYS = [15, 30]
+    agent_result = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            agent_result = planner_agent.invoke(
+                {"messages": planning_messages},
+                config={"callbacks": [DebugCallbackHandler()]}
+            )
+            break
+        except Exception as e:
+            error_name = type(e).__name__
+            is_transient = any(keyword in error_name for keyword in [
+                "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+                "RemoteDisconnected", "ConnectionReset"
+            ]) or "timed out" in str(e).lower()
+
+            if is_transient and attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt]
+                print(f"\n  ⚠️  Phase 1 Research Research failed ({error_name}), retrying in {delay}s... (attempt {attempt + 1}/{MAX_RETRIES})", flush=True)
+                time.sleep(delay)
+                continue
+            else:
+                print(f"DEBUG: Agentic planner FAILED: {str(e)}", flush=True)
+                raise e
+
+    phase1_duration = time.time() - start_time
+    print(f"\nDEBUG: Phase 1 (research) completed in {phase1_duration:.1f}s", flush=True)
 
     # Extract research context from the agent's tool interactions
     agent_messages = agent_result.get("messages", [])
@@ -926,6 +946,16 @@ def planner_node(state: AgentState) -> dict:
         plan_steps.append(plan_step)
 
     plan_steps = _enforce_systems_depth_requirements(task_description, plan_steps)
+
+    # ─── Complexity Ceiling Enforcement ───
+    # The planner prompt forbids "high" complexity, but enforce programmatically
+    # in case the LLM ignores the instruction.
+    for step in plan_steps:
+        if step.get("estimated_complexity", "").lower() == "high":
+            print(f"⚠️  COMPLEXITY CEILING: Downgrading step '{step['step_id']}' "
+                  f"from HIGH to MEDIUM. High-complexity steps should be "
+                  f"decomposed into smaller steps.", flush=True)
+            step["estimated_complexity"] = "medium"
 
     # ─── Approval Gate ───
     needs_approval, approval_reason = _needs_approval(evaluation, plan_steps)

@@ -8,7 +8,9 @@ The flow is:
 2.  **Tool Creation**: Loads all available tools (`file_tools`, `code_tools`, `memory_tools`, `search_tools`) and binds them to the workspace.
 3.  **Prompt Construction**:
     -   Builds a tiered context prompt using `MemoryManager.reconstruct_context`.
-    -   Includes system prompt, global context (Tier 2), local history (Tier 1), and the specific user instruction identifying the files to create (`impl.py`, `test.py`).
+    -   Includes system prompt with strict **anti-hardcoded-output rules** (forbidding large string literals in `impl.py`).
+    -   Injects `{dependency_context}` containing explicit paths to committed artifacts from all dependency steps.
+    -   Includes global context (Tier 2), local history (Tier 1), and the specific user instruction identifying the files to create (`impl.py`, `test.py`).
 4.  **Agent Execution**:
     -   Creates a `create_react_agent` with `gemini-3-pro-preview`.
     -   Invokes the agent loop, capturing tool calls and thoughts via a callback handler (`ToolLogHandler`).
@@ -39,6 +41,11 @@ Helper to sanitize LangChain message dictionaries.
 Factory to combine all toolsets.
 -   **Returns**: List of `StructuredTool` instances.
 
+### `_build_dependency_context(workspace, current_step) -> str`
+Resolves and formats paths to committed artifacts from dependency steps.
+-   **Logic**: Uses the `Workspace` contract to find the `committed/artifacts` directory for each dependency.
+-   **Returns**: A formatted string list of available dependency paths.
+
 ### `_prepare_executor_messages(...)`
 Constructs the input messages for the LLM.
 -   **Logic**:
@@ -58,6 +65,7 @@ The primary node function.
 
 -   **Logic**:
     -   Checks if plan is complete (if so, moves to reflecting/end).
+    -   Builds dependency context via `_build_dependency_context`.
     -   Builds tools and messages.
     -   Runs the ReAct agent.
     -   Processes result and updates state.

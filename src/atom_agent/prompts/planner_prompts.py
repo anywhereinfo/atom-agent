@@ -141,6 +141,27 @@ for passing tests. Passing tests are the ONLY signal of success.
 - Dependencies are satisfied ONLY when artifacts are in the dependency's `committed/` directory.
 
 ────────────────────────────────────────────────────────────
+## COMPLEXITY CEILING (MANDATORY)
+
+No step may have `estimated_complexity: "high"`. High complexity is a signal
+that the step is too large for the executor to implement in a single
+impl.py + test.py cycle.
+
+If a task naturally requires high-complexity work, you MUST decompose it:
+- Split the work into 2-3 sequential steps, each LOW or MEDIUM complexity.
+- Establish dependencies between them so outputs flow forward.
+- Each sub-step must have independently testable acceptance criteria.
+
+Example:
+  BAD:  One "high" step: "Build and evaluate the scoring system"
+  GOOD: Step 1 (medium): "Build the scoring model with unit tests"
+        Step 2 (medium): "Run scoring against test data, produce results"
+        Step 3 (low): "Evaluate results and generate comparison report"
+
+The `estimated_complexity` field MUST be one of: "low" or "medium".
+A plan containing any step with `estimated_complexity: "high"` is INVALID.
+
+────────────────────────────────────────────────────────────
 ## OUTPUT FORMAT (CRITICAL)
 
 When your plan is ready, you MUST call the `submit_plan` tool with a JSON string:
@@ -156,7 +177,7 @@ When your plan is ready, you MUST call the `submit_plan` tool with a JSON string
       "description": "Detailed technical instructions",
       "acceptance_criteria": ["Criterion 1", "Criterion 2"],
       "max_attempts": 3,
-      "estimated_complexity": "low|medium|high",
+      "estimated_complexity": "low|medium",
       "dependencies": ["other_step_id"],
       "uses_skills": [],
       "skill_instructions": null,
@@ -187,6 +208,7 @@ A plan is INVALID if:
 - Comparative/evaluation tasks can pass with survey-only output
   (e.g., taxonomy + pros/cons + benchmark name drops without
   systems-level analysis)
+- Any step has `estimated_complexity: "high"` — decompose it instead
 """
 
 
