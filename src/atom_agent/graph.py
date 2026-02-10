@@ -5,6 +5,7 @@ from .nodes.planner import planner_node
 from .nodes.executor import executor_node
 from .nodes.reflector import reflector_node
 from .nodes.commit import commit_node
+from .nodes.report_generator import report_generator_node
 
 def route_reflection(state: AgentState) -> str:
     """
@@ -45,6 +46,7 @@ def create_graph():
     graph.add_node("executor", executor_node)
     graph.add_node("reflector", reflector_node)
     graph.add_node("commit", commit_node)
+    graph.add_node("report_generator", report_generator_node)
 
     graph.set_entry_point("setup")
     graph.add_edge("setup", "planner")
@@ -75,9 +77,11 @@ def create_graph():
         route_post_commit,
         {
             "executor": "executor",
-            "end": END
+            "end": "report_generator"
         }
     )
+
+    graph.add_edge("report_generator", END)
 
     return graph.compile()
 

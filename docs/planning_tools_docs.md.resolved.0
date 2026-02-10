@@ -1,0 +1,41 @@
+# atom_agent.tools.planning_tools Documentation
+
+## Overall Flow
+[src/atom_agent/tools/planning_tools.py](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py) equips the Planner agent with the ability to research past work and formally submit the implementation plan. It acts as the bridge between the Planner's reasoning and the structured Agent State.
+
+The flow is:
+1.  **Factory**: [create_planning_tools(workspace)](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#35-155) bundles research tools (search + file reading) and the schema-enforced [submit_plan](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#108-151) tool.
+2.  **Research**: The planner uses [read_committed_artifact](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#47-71) and [list_completed_steps](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#72-107) to understand what has already been built (Tier 3 memory access).
+3.  **Submission**:
+    -   The agent calls [submit_plan](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#108-151) with a JSON string.
+    -   The tool validates the JSON against the [ImplementationPlanInput](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#28-33) Pydantic model.
+    -   It enforces regex patterns for step IDs and valid complexity levels.
+
+## Use Cases
+-   **Plan Generation**: The defining tool for the Planner node. It forces the LLM to structure its loose reasoning into a strict execution graph.
+-   **Historical Research**: Before planning step 5, the agent reads the report from step 4 to ensure continuity.
+
+## Edge Cases
+-   **Invalid JSON**: Returns a detailed error message if the LLM's JSON is malformed.
+-   **Schema Violations**: Returns Pydantic validation errors (e.g., "step_id must be lowercase snake_case") so the agent can self-correct.
+-   **No Previous Steps**: Initializes gracefully even if the [steps/](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#72-107) directory is empty (first run).
+
+## Method Documentation
+
+### [submit_plan(plan_json: str) -> str](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#108-151)
+The core output tool for the Planner.
+-   **Arguments**: JSON string matching [ImplementationPlanInput](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#28-33).
+-   **Validation**:
+    -   `task_id` must match.
+    -   [steps](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#72-107) must be a list.
+    -   `step_id` regex `^[a-z][a-z0-9_]{0,47}$`.
+    -   `estimated_complexity` enum: low, medium, high.
+-   **Returns**: Success message with step count.
+
+### [read_committed_artifact(step_id: str, artifact_name: str) -> str](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#47-71)
+Reads a file from a *completed* step's artifacts.
+-   **Example**: [read_committed_artifact("research_api", "api_docs.md")](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#47-71).
+
+### [list_completed_steps() -> str](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#72-107)
+Returns a summary of all past work.
+-   **Returns**: JSON list of step IDs and their artifact filenames.

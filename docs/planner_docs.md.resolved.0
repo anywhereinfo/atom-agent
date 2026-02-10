@@ -1,0 +1,64 @@
+# atom_agent.nodes.planner Documentation
+
+## Overall Flow
+[src/atom_agent/nodes/planner.py](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py) implements the autonomous planning node. It uses a ReAct agent equipped with research tools to analyze the task and generate a comprehensive implementation plan (`plan.json`).
+
+The flow is:
+1.  **Context Loading**: Checks for existing plans or workspaces. If this is a rollback, it loads failure context from the reflector.
+2.  **Tool Setup**: Provides `search_tools` and `planning_tools` (specifically `submit_plan`) to the agent.
+3.  **Prompt Engineering**:
+    -   Formats `PLANNER_USER_PROMPT` with task description, available skills, and any rollback context.
+    -   Includes specific criteria for "Systems Evaluation" tasks if detected ([_enforce_systems_depth_requirements](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py#49-73)).
+4.  **Agent Execution**:
+    -   Runs the planner agent (`gemini-3-pro-preview`).
+    -   The agent performs research (searching web/files) and then calls `submit_plan`.
+5.  **Plan Extraction**:
+    -   Parses the agent's messages to find the valid `submit_plan` tool call.
+    -   Validates the plan structure.
+6.  **Persistence**:
+    -   Converts the plan dictionary to [PlanStep](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/state.py#6-26) typed objects.
+    -   Enforces any additional criteria (e.g., specific evaluation metrics).
+    -   Saves the plan to `state/plan.json`.
+7.  **State Update**: Returns the initial plan and sets phase to `executing`.
+
+## Use Cases
+-   **Initial Planning**: Creates the roadmap for the agent.
+-   **Replanning**: Called when the reflector triggers a rollback (e.g., "This approach is fundamentally flawed").
+-   **Research**: The planner can search the web to understand libraries or APIs before adding them to the plan.
+
+## Edge Cases
+-   **Agent Fails to Submit**: Raises `ValueError` if the agent converses but never calls `submit_plan`.
+-   **Rollback**: Clears legacy steps to prevent "Ghost Context" when restarting a failed task sections.
+-   **Systems Evaluation**: Has special logic ([_is_systems_evaluation_task](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py#43-48)) to inject rigorous academic criteria into the plan automatically.
+
+## Method Documentation
+
+### [format_available_skills(skills: list) -> str](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py#29-33)
+Formats skill metadata for the prompt.
+
+### [_is_systems_evaluation_task(...)](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py#43-48)
+Heuristic to detect if the task is a complex system evaluation.
+-   **Logic**: Checks for keywords like "evaluate", "compare", "strategy", "framework".
+
+### [_enforce_systems_depth_requirements(...)](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py#49-73)
+Injects mandatory acceptance criteria for evaluation tasks.
+-   **Logic**: Adds requirements for "failure modes", "computational complexity", etc., if they are missing.
+
+### [_extract_plan_from_messages(...)](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py#74-106)
+Robustly finds the plan in the chat history.
+-   **Logic**:
+    -   Iterates backwards through messages.
+    -   Finds `tool_calls` with name `submit_plan`.
+    -   Finds the corresponding `ToolMessage` response.
+    -   Parses the JSON response to get the `validated_plan`.
+
+### [planner_node(state: AgentState) -> dict](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/planner.py#108-279)
+The primary node function.
+
+-   **Logic**:
+    -   Loads workspace/context.
+    -   Handles rollback (clears steps directory).
+    -   Loads historical context (Tier 2 memory).
+    -   Constructs `planning_tools`.
+    -   Runs ReAct agent.
+    -   Extracts and persists plan.

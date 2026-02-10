@@ -21,7 +21,7 @@ def main():
 
     # Initial state
     initial_state = {
-        "task_description": "A Structured Evaluation of Planning Strategies in Autonomous AI Systems.",
+        "task_description": "Formal Separation and Empirical Evaluation of Planning Algorithms vs Control Architectures in Autonomous LLM Agents.",
         "skill_name": "Agentic_Framework_Evaluator",
         "available_skills": [
             {

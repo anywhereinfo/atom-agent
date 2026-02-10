@@ -1,14 +1,18 @@
 import json
+from pathlib import Path
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langgraph.prebuilt import create_react_agent
+
 from ..state import AgentState
 from ..workspace import Workspace
 from ..config import get_llm
 from ..prompts.executor_prompts import EXECUTOR_SYSTEM_PROMPT, EXECUTOR_USER_PROMPT
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
-from langgraph.prebuilt import create_react_agent
-from pathlib import Path
 from ..memory import MemoryManager
 from ..tools.memory_tools import create_memory_tools
+from ..tools.file_tools import create_file_tools
+from ..tools.code_tools import create_code_tools
+from ..tools.search_tools import create_search_tools
 
 # Stub monitor for pulse tracking
 class SimpleMonitor:
@@ -45,11 +49,8 @@ def _clean_message(msg: dict) -> dict:
                  part["extras"].pop("signature", None)
                  if not part["extras"]:
                      part.pop("extras")
-    
+
     return msg
-from ..tools.file_tools import create_file_tools
-from ..tools.code_tools import create_code_tools
-from ..tools.search_tools import create_search_tools
 
 def _load_executor_tools(current_step: dict, workspace: Workspace) -> list:
     """Returns the list of executable tool instances for the agent, bound to the workspace."""
@@ -146,9 +147,9 @@ def _process_executor_result(result: dict, current_step: dict, history_start_idx
     attempt_num = current_step.get("current_attempt", 1)
     attempt_id = f"a{attempt_num:02d}"
 
-    # Resolve messages dir and staging files
-    msg_dir_rel = f"steps/{step_id}/messages/"
-    
+    # Resolve messages dir and staging files using workspace contract
+    msg_dir_rel = workspace.get_path("step_messages_dir", step_id=step_id) if workspace else f"steps/{step_id}/messages/"
+
     staging_paths = workspace.get_staging_paths(step_id, attempt_id) if workspace else {}
     impl_path_rel = staging_paths.get("impl", "")
     test_path_rel = staging_paths.get("test", "")

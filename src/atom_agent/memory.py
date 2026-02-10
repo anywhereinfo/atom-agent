@@ -3,6 +3,7 @@ from pathlib import Path
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from sentence_transformers import CrossEncoder
 from typing import List, Dict, Any, Optional
+import json
 
 class MemoryManager:
     """
@@ -22,9 +23,9 @@ class MemoryManager:
     def load_step_history(workspace: Workspace, step_id: str) -> List[BaseMessage]:
         """Loads full message history from the step-level directory."""
         task_dir_rel = workspace.task_directory_rel
-        
-        # We enforce step-level messages now
-        msg_dir_rel = f"steps/{step_id}/messages/"
+
+        # Use workspace contract for path resolution
+        msg_dir_rel = workspace.get_path("step_messages_dir", step_id=step_id)
         history_path = Path(task_dir_rel) / msg_dir_rel / "history.json"
 
         if not history_path.exists():

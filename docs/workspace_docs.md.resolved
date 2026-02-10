@@ -1,0 +1,45 @@
+# atom_agent.workspace Documentation
+
+## Overall Flow
+[src/atom_agent/workspace.py](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py) manages file system paths, resource allocation, and project structure rules for the agent. It enforces a "Workspace Contract" that ensures the agent operates within defined boundaries and uses consistent file paths.
+
+The flow is:
+1.  **Contract Definition**: The [Workspace](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#5-53) class defines schemas for directory structures, naming conventions, and file permissions using Pydantic.
+2.  **Path Resolution**: The [get_path](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#23-32) method resolves complex path templates (e.g., `{step_id}/checkpoints/ckpt_{attempt_id}.json`) into concrete strings.
+3.  **Staging Helpers**: [get_staging_paths](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#33-44) provides a standardized dictionary of paths needed for executing a single step attempt (impl.py, test.py, artifacts, logs).
+
+## Use Cases
+-   **Path Management**: Instead of hardcoding paths like `"tasks/" + task_id + "/step1"`, other components ask the Workspace for the correct path.
+-   **Security**: Can enforce read/write rules to prevent the agent from accessing sensitive directories (though currently mostly path resolution).
+
+## Edge Cases
+-   **Missing Path Key**: [get_path](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#23-32) raises a `KeyError` if a requested template key is not defined in the contract.
+-   **Invalid Template Args**: Standard Python string formatting errors if required arguments for a template are missing.
+
+## Class Documentation
+
+### [Workspace](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#5-53) (Pydantic Model)
+The authoritative configuration object for the task environment.
+
+-   **Fields**:
+    -   `task_id`, `task_directory_rel`, `task_directory_abs`: Task identity.
+    -   [paths](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#33-44): A dictionary of path templates (e.g., `attempt_impl`: `steps/{step_id}/attempts/{attempt_id}/impl.py`).
+    -   `write_rules`, `read_rules`: Permissions.
+    -   `naming`, `step_structure`, `defaults`: Configuration.
+
+### [get_path(key: str, **kwargs) -> str](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#23-32)
+Resolves a path template.
+
+-   **Arguments**:
+    -   `key`: The name of the path template to use.
+    -   `**kwargs`: Values to fill into the template.
+-   **Returns**: The resolved path string.
+-   **Raises**: `KeyError`.
+
+### [get_staging_paths(step_id: str, attempt_id: str) -> Dict[str, str]](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#33-44)
+Returns a dictionary of common paths for an execution attempt.
+
+-   **Returns**: Keys `impl`, `test`, `artifacts_dir`, `messages_dir`, `errors_dir` mapping to their resolved paths.
+
+### [from_dict(cls, data: Dict[str, Any]) -> Workspace](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#49-53)
+Factory method to create a Workspace instance from a dictionary (e.g., loaded from `workspace.json`).

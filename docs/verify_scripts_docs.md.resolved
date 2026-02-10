@@ -1,0 +1,43 @@
+# Verification Scripts Documentation
+
+## Overview
+These scripts (`verify_*.py`) are standalone test harnesses used to assert the correctness of critical agent components *without* running the full agent loop. They serve as unit tests and integration tests for the agent's infrastructure.
+
+## Scripts
+
+### 1. [verify_arc_setup.py](file://wsl$/Ubuntu/home/jim/code/atom/verify_arc_setup.py)
+**Goal**: Verifies that the [setup](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/nodes/setup.py#21-199) node correctly initializes the Attempt-Reflect-Commit (ARC) file structure.
+-   **Checks**:
+    -   Creation of `inputs/`, [steps/](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/planning_tools.py#72-107), `state/`, `logs/`.
+    -   Structure of `workspace.json` (regex rules, path templates, permissions).
+    -   Initialization of `task.json` and `plan.json`.
+-   **Key Assertion**: Ensures `workspace.json` contains the machine-enforceable rules that downstream nodes rely on.
+
+### 2. [verify_executor_prompt_v2.py](file://wsl$/Ubuntu/home/jim/code/atom/verify_executor_prompt_v2.py)
+**Goal**: Verifies that the `Executor` prompt is constructed correctly with all necessary context.
+-   **Checks**:
+    -   Dynamic injection of `step_id`, `attempt_id`, and `acceptance_criteria`.
+    -   Presence of mandatory `staged_impl_path` and `staged_test_path`.
+-   **Key Assertion**: The prompt must contain JSON-formatted instructions that match the current state.
+
+### 3. [verify_path_resolution.py](file://wsl$/Ubuntu/home/jim/code/atom/verify_path_resolution.py)
+**Goal**: Verifies that the `Planner` node respects the paths defined in the [Workspace](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/workspace.py#5-53) contract.
+-   **Checks**:
+    -   Ability to read [config.py](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/config.py).
+    -   Resolution of `plan.json` path from the workspace object.
+-   **Key Assertion**: The planner must not hardcode paths; it must look them up in the workspace.
+
+### 4. [verify_search_tool.py](file://wsl$/Ubuntu/home/jim/code/atom/verify_search_tool.py)
+**Goal**: Verifies that external tools load correctly based on environment variables.
+-   **Checks**:
+    -   `tavily_search` is NOT loaded if API key is missing.
+    -   `tavily_search` IS loaded if API key is present.
+-   **Key Assertion**: The agent gracefully degrades if external services are unavailable.
+
+### 5. [verify_workspace_bound_tools.py](file://wsl$/Ubuntu/home/jim/code/atom/verify_workspace_bound_tools.py)
+**Goal**: Verifies that file system tools ([write_file](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/file_tools.py#28-39), [execute_python_code](file://wsl$/Ubuntu/home/jim/code/atom/src/atom_agent/tools/code_tools.py#29-69)) are strictly confined to the task directory.
+-   **Checks**:
+    -   Relative path resolution (`sub/test.txt` -> `{task_dir}/sub/test.txt`).
+    -   Execution of code in the correct CWD.
+    -   Cleanup of test directories.
+-   **Key Assertion**: Tools operation within the sandbox boundary.

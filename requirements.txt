@@ -9,3 +9,4 @@ sentencepiece
 tavily-python
 langchain-community
 langchain-tavily
+arxiv

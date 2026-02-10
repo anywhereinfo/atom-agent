@@ -97,6 +97,7 @@ def task_setup_node(state: AgentState) -> dict:
             "step_dir": "steps/{step_id}/",
             "step_state_path": "steps/{step_id}/step_state.json",
             "reflector_path": "steps/{step_id}/reflector.json",
+            "step_messages_dir": "steps/{step_id}/messages/",
 
             "attempt_dir": "steps/{step_id}/attempts/{attempt_id}/",
             "attempt_impl": "steps/{step_id}/attempts/{attempt_id}/impl.py",
@@ -109,6 +110,7 @@ def task_setup_node(state: AgentState) -> dict:
             "committed_impl": "steps/{step_id}/committed/impl.py",
             "committed_test": "steps/{step_id}/committed/test.py",
             "committed_artifacts_dir": "steps/{step_id}/committed/artifacts/",
+            "committed_messages_dir": "steps/{step_id}/committed/messages/",
             "commit_manifest": "steps/{step_id}/committed/manifest.json"
         },
 

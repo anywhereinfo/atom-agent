@@ -56,15 +56,18 @@ def reflector_node(state: AgentState) -> Dict[str, Any]:
                     artifacts_found.append(f"File: {p.name} (Binary or unreadable)")
     artifacts_summary = "\n\n".join(artifacts_found) if artifacts_found else "No artifacts found in staging directory."
 
-    # C. Recent Messages (Tier 1 Memory)
-    messages = state.get("messages", [])
-    if not messages:
-        messages = MemoryManager.load_step_history(workspace, step_id)
-    
+    # C. Recent Messages (Tier 1 Memory) - Always use MemoryManager for consistency
+    messages = MemoryManager.load_step_history(workspace, step_id)
+
     recent_messages_str = ""
     for m in messages[-10:]: # Last 10 messages for context
-        content = m.content if hasattr(m, 'content') else str(m)
-        type_name = type(m).__name__
+        if hasattr(m, 'content'):
+            content = m.content
+        elif isinstance(m, dict):
+            content = m.get('content', str(m))
+        else:
+            content = str(m)
+        type_name = type(m).__name__ if not isinstance(m, dict) else m.get('type', 'Message')
         recent_messages_str += f"[{type_name}]: {content}\n"
 
     # D. Dependencies

@@ -1,50 +1,579 @@
-from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Dict
+from typing import List, Dict, Any, Optional, Tuple
 import json
+import re
+import time
+import concurrent.futures
 from pathlib import Path
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.callbacks import BaseCallbackHandler
+from langgraph.prebuilt import create_react_agent
+
 from ..prompts.planner_prompts import PLANNER_SYSTEM_PROMPT, PLANNER_USER_PROMPT
+from ..prompts.plan_judge_prompts import (
+    PLAN_GENERATION_DIRECTIVES,
+    PLAN_GENERATION_PROMPT,
+    PLAN_JUDGE_SYSTEM_PROMPT,
+    PLAN_JUDGE_USER_PROMPT,
+)
 from ..state import AgentState, PlanStep
 from ..workspace import Workspace
-from ..config import get_llm
-from langchain_core.prompts import ChatPromptTemplate
+from ..config import get_llm, on_rate_limit_hit, on_rate_limit_clear
+from ..memory import MemoryManager
+from ..tools.planning_tools import create_planning_tools, ImplementationPlanInput
 
-class PlanStepModel(BaseModel):
-    step_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,47}$")
-    title: str
-    description: str
-    acceptance_criteria: List[str]
-    max_attempts: int = 3
-    estimated_complexity: Literal["low", "medium", "high"]
-    dependencies: List[str] = Field(default_factory=list)
-    uses_skills: List[str] = Field(default_factory=list)
-    skill_instructions: Optional[Dict[str, str]] = None
-    can_run_in_parallel: bool = False
 
-class ImplementationPlan(BaseModel):
-    task_id: str
-    task_directory_rel: str
-    steps: List[PlanStepModel]
+# ────────────────────────────────────────────────────────────
+# Constants
+# ────────────────────────────────────────────────────────────
+
+DEFAULT_CANDIDATE_COUNT = 3
+ESCALATED_CANDIDATE_COUNT = 5
+ESCALATION_MARGIN_THRESHOLD = 3      # Escalate if top-2 margin <= this
+ESCALATION_MIN_SCORE_THRESHOLD = 40  # Escalate if best score < this (out of 60)
+APPROVAL_CONFIDENCE_THRESHOLD = 35   # Auto-proceed if total_score >= this
+
+SYSTEMS_EVAL_DATA_CRITERIA = [
+    "Structured evaluation data captures systems-level fields for each evaluated approach: planning topology, control model, computational complexity, failure modes, determinism class, observability/governance, enterprise suitability, and composition patterns.",
+    "Each evaluated approach includes at least one concrete failure scenario and one production use case."
+]
+
+SYSTEMS_EVAL_REPORT_CRITERIA = [
+    "The report includes an architectural comparison matrix covering planning topology, control model, computational complexity, failure modes, determinism spectrum, observability/governance, enterprise readiness, and composition patterns.",
+    "Each evaluated approach includes explicit complexity and cost analysis (token growth, branching behavior, latency amplification, tool overhead, or memory scaling) with formal notation where applicable.",
+    "The report includes enterprise deployment guidance: cost predictability, reliability constraints, security/isolation considerations, and explainability/auditability implications."
+]
+
+SYSTEMS_EVAL_DATA_HINTS = ("populate", "schema", "data", "dataset")
+SYSTEMS_EVAL_REPORT_HINTS = ("report", "analysis", "evaluate", "evaluation", "comparison", "summary")
+
+
+# ────────────────────────────────────────────────────────────
+# Debug Callback Handler (unchanged)
+# ────────────────────────────────────────────────────────────
+
+class DebugCallbackHandler(BaseCallbackHandler):
+    def __init__(self):
+        self._time = time
+        self._llm_start_time = None
+        self._llm_call_count = 0
+
+    def on_llm_start(self, serialized: Dict, prompts: List[str], **kwargs):
+        self._llm_call_count += 1
+        self._llm_start_time = self._time.time()
+        print(f"\nDEBUG: [LLM Call #{self._llm_call_count}] Sending request to Gemini...", flush=True)
+
+    def on_llm_new_token(self, token: str, **kwargs):
+        print(token, end="", flush=True)
+
+    def on_llm_end(self, response, **kwargs):
+        duration = self._time.time() - self._llm_start_time if self._llm_start_time else 0
+        print(f"\nDEBUG: [LLM Call #{self._llm_call_count}] Gemini responded in {duration:.1f}s", flush=True)
+        on_rate_limit_clear()
+
+    def on_llm_error(self, error, **kwargs):
+        duration = self._time.time() - self._llm_start_time if self._llm_start_time else 0
+        error_str = str(error)
+        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            on_rate_limit_hit()
+            print(f"\n⚠️  DEBUG: [LLM Call #{self._llm_call_count}] RATE LIMITED after {duration:.1f}s! Retrying with backoff...", flush=True)
+        else:
+            print(f"\n❌ DEBUG: [LLM Call #{self._llm_call_count}] LLM ERROR after {duration:.1f}s: {error_str[:200]}", flush=True)
+
+    def on_retry(self, retry_state, **kwargs):
+        attempt = getattr(retry_state, 'attempt_number', '?')
+        print(f"\n🔄 DEBUG: Retry attempt #{attempt} — waiting before next try...", flush=True)
+
+    def on_tool_start(self, serialized: Dict, input_str: str, **kwargs):
+        tool_name = serialized.get("name") if serialized else "Unknown Tool"
+        print(f"\nDEBUG: [Tool] Executing: {tool_name}", flush=True)
+        print(f"DEBUG: [Tool] Input: {input_str}", flush=True)
+
+    def on_tool_end(self, output: str, **kwargs):
+        print(f"DEBUG: [Tool] Output: {str(output)}", flush=True)
+
+    def on_tool_error(self, error, **kwargs):
+        print(f"❌ DEBUG: [Tool] ERROR: {str(error)[:300]}", flush=True)
+
+
+# ────────────────────────────────────────────────────────────
+# Helper Functions
+# ────────────────────────────────────────────────────────────
 
 def format_available_skills(skills: list) -> str:
     if not skills:
         return "None"
     return "\n".join([f"- {s['name']}: {s['description']}" for s in skills])
 
-def planner_node(state: AgentState) -> dict:
-    llm = get_llm("planner")
-    structured_llm = llm.with_structured_output(ImplementationPlan)
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", PLANNER_SYSTEM_PROMPT),
-        ("user", PLANNER_USER_PROMPT)
+def _append_unique_criteria(criteria: List[str], additions: List[str]) -> List[str]:
+    normalized = {c.strip().lower() for c in criteria}
+    for item in additions:
+        key = item.strip().lower()
+        if key not in normalized:
+            criteria.append(item)
+            normalized.add(key)
+    return criteria
+
+
+def _is_systems_evaluation_task(task_description: str) -> bool:
+    text = (task_description or "").lower()
+    has_eval_intent = bool(re.search(r"\b(evaluate|evaluation|compare|comparison|benchmark|assess|trade[- ]?off)\b", text))
+    has_strategy_subject = bool(re.search(r"\b(strategy|strategies|architecture|architectures|framework|frameworks|planning|agentic|autonomous)\b", text))
+    return has_eval_intent and has_strategy_subject
+
+
+def _enforce_systems_depth_requirements(task_description: str, plan_steps: List[PlanStep]) -> List[PlanStep]:
+    if not _is_systems_evaluation_task(task_description):
+        return plan_steps
+    for step in plan_steps:
+        step_text = " ".join([
+            step.get("step_id", ""),
+            step.get("title", ""),
+            step.get("description", "")
+        ]).lower()
+        if any(hint in step_text for hint in SYSTEMS_EVAL_DATA_HINTS):
+            step["acceptance_criteria"] = _append_unique_criteria(
+                step.get("acceptance_criteria", []),
+                SYSTEMS_EVAL_DATA_CRITERIA
+            )
+        if any(hint in step_text for hint in SYSTEMS_EVAL_REPORT_HINTS):
+            step["acceptance_criteria"] = _append_unique_criteria(
+                step.get("acceptance_criteria", []),
+                SYSTEMS_EVAL_REPORT_CRITERIA
+            )
+    return plan_steps
+
+
+def _extract_plan_from_messages(messages: List) -> Dict:
+    """Extract the submitted plan from the agent's tool call messages."""
+    for msg in reversed(messages):
+        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                if tool_call.get('name') == 'submit_plan':
+                    tool_call_id = tool_call.get('id')
+                    for response_msg in messages:
+                        if (hasattr(response_msg, 'tool_call_id') and
+                            response_msg.tool_call_id == tool_call_id):
+                            try:
+                                response_data = json.loads(response_msg.content)
+                                if response_data.get("status") == "success":
+                                    validated_plan = response_data.get("validated_plan")
+                                    if validated_plan:
+                                        return validated_plan
+                            except Exception as e:
+                                print(f"DEBUG: Failed to parse submit_plan response: {str(e)}", flush=True)
+                                continue
+    raise ValueError("No valid submit_plan tool call found in agent messages")
+
+
+def _extract_research_context(messages: List) -> str:
+    """
+    Extract research context from the ReAct agent's tool interactions.
+    Captures tool calls and their outputs to provide shared context
+    for all candidate plan generators.
+    """
+    context_parts = []
+    for msg in messages:
+        # Capture tool call results (research findings)
+        if hasattr(msg, 'tool_call_id') and msg.tool_call_id:
+            tool_name = getattr(msg, 'name', 'unknown_tool')
+            content = str(msg.content)
+            # Skip submit_plan responses — that's the plan itself
+            if tool_name == 'submit_plan':
+                continue
+            # Truncate very long tool outputs
+            if len(content) > 3000:
+                content = content[:3000] + "\n... [truncated]"
+            context_parts.append(f"### Tool: {tool_name}\n{content}\n")
+
+        # Capture the agent's reasoning/synthesis messages
+        elif hasattr(msg, 'content') and not hasattr(msg, 'tool_calls'):
+            content = str(msg.content)
+            if content and len(content) > 50:  # Skip short acknowledgements
+                if len(content) > 2000:
+                    content = content[:2000] + "\n... [truncated]"
+                context_parts.append(f"### Agent Analysis\n{content}\n")
+
+    if not context_parts:
+        return "No research data collected."
+
+    return "\n".join(context_parts)
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 2: Plan Candidate Generation
+# ────────────────────────────────────────────────────────────
+
+def _generate_single_candidate(
+    directive: Dict,
+    task_description: str,
+    workspace_context: str,
+    research_context: str,
+    skill_name: str,
+    available_skills_summary: str,
+    historical_context: str,
+    rollback_context: str,
+) -> Optional[Dict]:
+    """Generate a single plan candidate following a specific directive."""
+    try:
+        prompt = PLAN_GENERATION_PROMPT.format(
+            directive_label=directive["label"],
+            directive_instruction=directive["instruction"],
+            task_description=task_description,
+            workspace_context=workspace_context,
+            research_context=research_context,
+            skill_name=skill_name,
+            available_skills_summary=available_skills_summary,
+            historical_context=historical_context,
+            rollback_context=rollback_context,
+        )
+
+        llm = get_llm("plan_generator")
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        plan_data = json.loads(raw)
+
+        # Validate with Pydantic
+        validated = ImplementationPlanInput(**plan_data)
+        return {
+            "directive": directive["id"],
+            "directive_label": directive["label"],
+            "steps_count": len(validated.steps),
+            "plan": validated.model_dump()
+        }
+
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️  Candidate '{directive['id']}': Invalid JSON — {str(e)[:100]}", flush=True)
+        return None
+    except Exception as e:
+        print(f"  ⚠️  Candidate '{directive['id']}': Failed — {str(e)[:200]}", flush=True)
+        return None
+
+
+def _generate_plan_candidates(
+    num_candidates: int,
+    task_description: str,
+    workspace_context: str,
+    research_context: str,
+    skill_name: str,
+    available_skills_summary: str,
+    historical_context: str,
+    rollback_context: str,
+) -> List[Dict]:
+    """Generate N diverse plan candidates, one per directive."""
+    directives = PLAN_GENERATION_DIRECTIVES[:num_candidates]
+    candidates = []
+
+    print(f"\n{'─' * 60}", flush=True)
+    print(f"PLAN GENERATOR: Generating {num_candidates} candidate plans...", flush=True)
+    print(f"{'─' * 60}", flush=True)
+
+    for i, directive in enumerate(directives):
+        print(f"  [{i+1}/{num_candidates}] Generating: {directive['label']}...", flush=True)
+        start = time.time()
+
+        candidate = _generate_single_candidate(
+            directive=directive,
+            task_description=task_description,
+            workspace_context=workspace_context,
+            research_context=research_context,
+            skill_name=skill_name,
+            available_skills_summary=available_skills_summary,
+            historical_context=historical_context,
+            rollback_context=rollback_context,
+        )
+
+        elapsed = time.time() - start
+        if candidate:
+            print(f"  ✅ '{directive['id']}': {candidate['steps_count']} steps ({elapsed:.1f}s)", flush=True)
+            candidates.append(candidate)
+        else:
+            print(f"  ❌ '{directive['id']}': Failed ({elapsed:.1f}s)", flush=True)
+
+    print(f"\nPLAN GENERATOR: {len(candidates)}/{num_candidates} valid candidates produced.", flush=True)
+    return candidates
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 3: Plan Judging
+# ────────────────────────────────────────────────────────────
+
+def _format_candidates_for_judge(candidates: List[Dict]) -> str:
+    """Format all candidates as a numbered list for the judge."""
+    parts = []
+    for i, c in enumerate(candidates):
+        plan = c["plan"]
+        steps_summary = []
+        for step in plan["steps"]:
+            deps = step.get("dependencies", [])
+            criteria_count = len(step.get("acceptance_criteria", []))
+            steps_summary.append(
+                f"    - `{step['step_id']}`: {step['title']} "
+                f"[{step.get('estimated_complexity', '?')}] "
+                f"(deps: {deps or 'none'}, criteria: {criteria_count}, "
+                f"parallel: {step.get('can_run_in_parallel', False)}, "
+                f"max_attempts: {step.get('max_attempts', 3)})"
+            )
+
+        parts.append(
+            f"### Candidate {i} — {c['directive_label']}\n"
+            f"**Directive**: {c['directive']}\n"
+            f"**Steps**: {c['steps_count']}\n"
+            f"**Step Details**:\n" + "\n".join(steps_summary) + "\n"
+            f"\n**Full Plan JSON**:\n```json\n{json.dumps(plan, indent=2)}\n```\n"
+        )
+
+    return "\n---\n".join(parts)
+
+
+def _judge_plans(
+    candidates: List[Dict],
+    task_description: str,
+) -> Dict:
+    """
+    Evaluate all candidates and select the best one.
+    Returns the full judge evaluation including scores and reasoning.
+    """
+    if len(candidates) == 1:
+        # Only one valid candidate — auto-select
+        return {
+            "evaluations": [{
+                "candidate_index": 0,
+                "scores": {"coverage": 7, "decomposition": 7, "dependency_structure": 7,
+                           "complexity_balance": 7, "parallelism": 7, "risk_management": 7},
+                "total_score": 42,
+                "strengths": ["Only valid candidate"],
+                "weaknesses": []
+            }],
+            "selected_index": 0,
+            "selection_reasoning": "Single valid candidate — auto-selected.",
+            "margin": 0,
+            "risk_level": "medium",
+            "escalation_recommended": True,
+            "escalation_reason": "Only one valid candidate was generated."
+        }
+
+    print(f"\n{'─' * 60}", flush=True)
+    print(f"PLAN JUDGE: Evaluating {len(candidates)} candidates...", flush=True)
+    print(f"{'─' * 60}", flush=True)
+
+    formatted = _format_candidates_for_judge(candidates)
+    user_prompt = PLAN_JUDGE_USER_PROMPT.format(
+        task_description=task_description,
+        formatted_candidates=formatted,
+    )
+
+    llm = get_llm("plan_judge")
+    start = time.time()
+
+    response = llm.invoke([
+        SystemMessage(content=PLAN_JUDGE_SYSTEM_PROMPT),
+        HumanMessage(content=user_prompt),
     ])
 
+    raw = response.content.strip()
+    elapsed = time.time() - start
+
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        evaluation = json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"  ⚠️  Judge returned invalid JSON. Falling back to candidate 0.", flush=True)
+        return {
+            "evaluations": [],
+            "selected_index": 0,
+            "selection_reasoning": "Judge returned unparseable output — defaulted to first candidate.",
+            "margin": 0,
+            "risk_level": "medium",
+            "escalation_recommended": True,
+            "escalation_reason": "Judge evaluation failed."
+        }
+
+    selected = evaluation.get("selected_index", 0)
+    margin = evaluation.get("margin", 0)
+    risk = evaluation.get("risk_level", "medium")
+
+    print(f"  JUDGE: Selected candidate {selected} ({candidates[selected]['directive_label']})", flush=True)
+    print(f"  JUDGE: Margin: {margin}, Risk: {risk} ({elapsed:.1f}s)", flush=True)
+    print(f"  JUDGE: Reasoning: {evaluation.get('selection_reasoning', 'N/A')[:200]}", flush=True)
+
+    return evaluation
+
+
+# ────────────────────────────────────────────────────────────
+# Escalation & Approval Logic
+# ────────────────────────────────────────────────────────────
+
+def _should_escalate(evaluation: Dict, current_count: int) -> bool:
+    """
+    Determine if we should generate more candidates.
+    Only escalates from 3 → 5.
+    """
+    if current_count >= ESCALATED_CANDIDATE_COUNT:
+        return False  # Already at max
+
+    # Judge explicitly recommended escalation
+    if evaluation.get("escalation_recommended", False):
+        return True
+
+    # Margin too thin — candidates are too similar
+    margin = evaluation.get("margin", 0)
+    if margin <= ESCALATION_MARGIN_THRESHOLD:
+        return True
+
+    # Best score too low — all candidates weak
+    evals = evaluation.get("evaluations", [])
+    if evals:
+        best_score = max(e.get("total_score", 0) for e in evals)
+        if best_score < ESCALATION_MIN_SCORE_THRESHOLD:
+            return True
+
+    return False
+
+
+def _needs_approval(evaluation: Dict, plan_steps: List) -> Tuple[bool, str]:
+    """
+    Determine if the plan needs user approval before execution.
+
+    Returns (needs_approval: bool, reason: str)
+
+    Approval required for:
+    - High risk level
+    - Low winning score
+    - Any step with HIGH complexity and potential side effects
+    """
+    risk_level = evaluation.get("risk_level", "medium")
+
+    # High risk always needs approval
+    if risk_level == "high":
+        return True, "Plan classified as HIGH risk by judge."
+
+    # Low winning score
+    evals = evaluation.get("evaluations", [])
+    selected_idx = evaluation.get("selected_index", 0)
+    if evals and selected_idx < len(evals):
+        winner_score = evals[selected_idx].get("total_score", 0)
+        if winner_score < APPROVAL_CONFIDENCE_THRESHOLD:
+            return True, f"Winner score ({winner_score}/60) below confidence threshold ({APPROVAL_CONFIDENCE_THRESHOLD})."
+
+    # Any HIGH complexity step (potential destructive/side-effect)
+    high_risk_steps = [s for s in plan_steps if s.get("estimated_complexity") == "high"]
+    if len(high_risk_steps) > len(plan_steps) // 2:
+        return True, f"{len(high_risk_steps)}/{len(plan_steps)} steps are HIGH complexity."
+
+    # Auto-proceed for low-risk plans
+    return False, ""
+
+
+def _format_approval_summary(
+    evaluation: Dict,
+    candidates: List[Dict],
+    winner_steps: List,
+) -> str:
+    """Format a concise summary for user approval."""
+    selected = evaluation.get("selected_index", 0)
+    winner = candidates[selected]
+
+    lines = [
+        f"\n{'=' * 60}",
+        f"⚠️  PLAN APPROVAL REQUIRED",
+        f"{'=' * 60}",
+        f"",
+        f"🏆 Winner: {winner['directive_label']} ({winner['steps_count']} steps)",
+        f"   Reasoning: {evaluation.get('selection_reasoning', 'N/A')[:200]}",
+        f"   Risk Level: {evaluation.get('risk_level', 'unknown').upper()}",
+        f"",
+        f"📋 Steps:",
+    ]
+
+    for step in winner_steps:
+        lines.append(f"   {step['step_id']}: {step['title']} [{step.get('estimated_complexity', '?')}]")
+
+    # Top risks
+    evals = evaluation.get("evaluations", [])
+    if evals and selected < len(evals):
+        weaknesses = evals[selected].get("weaknesses", [])
+        if weaknesses:
+            lines.append(f"\n⚠️  Top Risks:")
+            for w in weaknesses[:3]:
+                lines.append(f"   - {w}")
+
+    # Alternatives
+    lines.append(f"\n📊 Alternatives:")
+    for i, c in enumerate(candidates):
+        if i == selected:
+            continue
+        score = "?"
+        if evals and i < len(evals):
+            score = evals[i].get("total_score", "?")
+        lines.append(f"   [{i}] {c['directive_label']} ({c['steps_count']} steps, score: {score})")
+
+    lines.extend([
+        f"",
+        f"{'=' * 60}",
+    ])
+
+    return "\n".join(lines)
+
+
+# ────────────────────────────────────────────────────────────
+# Persistence
+# ────────────────────────────────────────────────────────────
+
+def _persist_candidates(
+    task_dir: Path,
+    candidates: List[Dict],
+    evaluation: Dict,
+    escalation_history: List[str],
+) -> None:
+    """Save all candidates and judge evaluation for auditability."""
+    artifact = {
+        "candidates": candidates,
+        "evaluation": evaluation,
+        "escalation_history": escalation_history,
+        "selected_index": evaluation.get("selected_index", 0),
+        "selected_directive": candidates[evaluation.get("selected_index", 0)]["directive"]
+            if candidates else "none",
+    }
+
+    path = task_dir / "state" / "plan_candidates.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(artifact, f, indent=2)
+    print(f"DEBUG: Plan candidates persisted to {path}", flush=True)
+
+
+# ────────────────────────────────────────────────────────────
+# Main Planner Node
+# ────────────────────────────────────────────────────────────
+
+def planner_node(state: AgentState) -> dict:
+    """
+    Agentic planner with multi-plan generation and selection.
+
+    3-Phase Process:
+    1. RESEARCH  — Single ReAct agent gathers domain context
+    2. GENERATE  — 3 diverse plan candidates (escalates to 5 if needed)
+    3. JUDGE     — Evaluates candidates and selects the best one
+
+    Includes approval gates for high-risk or low-confidence plans.
+    """
+    # ─── Setup ───
+    llm = get_llm("planner")
     available_skills_summary = format_available_skills(state.get("available_skills", []))
-    
-    # Authoritative Workspace Contract from state
+
     workspace = state.get("workspace")
     if not workspace:
-        # Fallback to reading disk if not in state (e.g. initial dev or resumed task)
         context = state.get("task_context", {})
         task_dir_rel = context.get("task_dir_rel")
         if task_dir_rel:
@@ -55,11 +584,11 @@ def planner_node(state: AgentState) -> dict:
                         workspace_data = json.load(f)
                         workspace = Workspace.from_dict(workspace_data)
                 except Exception as e:
-                    print(f"DEBUG: Failed to read workspace.json from disk: {str(e)}", flush=True)
+                    print(f"DEBUG: Failed to read workspace.json: {str(e)}", flush=True)
 
     workspace_context_str = json.dumps(workspace.model_dump(), indent=2) if workspace else "{}"
 
-    # Rollback / Failure Context & Cleanup
+    # ─── Rollback / Failure Context & Cleanup ───
     review = state.get("reflector_review")
     rollback_context = "No previous failures reported."
     if review and review.get("decision") == "rollback":
@@ -69,83 +598,260 @@ def planner_node(state: AgentState) -> dict:
             f"Issues: {', '.join(review.get('issues_identified', []))}\n"
             f"Hint: {review.get('alternative_approach_hint', 'No hint provided')}"
         )
-        # Complete Reset: Wipe the steps directory to avoid "Ghost Context" residues
         if workspace:
             steps_dir = Path(workspace.task_directory_rel) / "steps"
             if steps_dir.exists():
                 import shutil
                 try:
-                    # We keep the steps/ dir but clear its children
                     for item in steps_dir.iterdir():
                         if item.is_dir():
                             shutil.rmtree(item)
                         else:
                             item.unlink()
-                    print(f"DEBUG: Complete Reset performed. Cleared legacy steps in {steps_dir}", flush=True)
+                    print(f"DEBUG: Complete Reset performed. Cleared {steps_dir}", flush=True)
                 except Exception as e:
                     print(f"DEBUG: Failed to clear legacy steps: {str(e)}", flush=True)
 
-    print(f"DEBUG: Planning for task: {state['task_description'][:50]}...", flush=True)
-    
-    chain = prompt | structured_llm
-    import time
+    # ─── Historical Context ───
+    historical_context = "No previous completed steps."
+    plan = state.get("implementation_plan", [])
+    current_step_idx = state.get("current_step_index", 0)
+    if workspace and plan and current_step_idx > 0:
+        try:
+            historical_context = MemoryManager.load_previous_step_reports(
+                workspace=workspace,
+                plan=plan,
+                current_step_idx=current_step_idx,
+                query=state.get("task_description", ""),
+                top_k=5,
+                min_score=0.0
+            )
+        except Exception as e:
+            print(f"DEBUG: Failed to load historical context: {str(e)}", flush=True)
+
+    task_description = state["task_description"]
+    skill_name = state.get("skill_name") or "Not Specified"
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 1: RESEARCH (Single ReAct Agent)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"PLANNER PHASE 1: Research & Exploration", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    print(f"Task: {task_description[:80]}...", flush=True)
+
+    task_context = state.get("task_context", {})
+    planning_tools = create_planning_tools(workspace, task_context)
+
+    user_prompt = PLANNER_USER_PROMPT.format(
+        task_description=task_description,
+        workspace_context=workspace_context_str,
+        skill_name=skill_name,
+        available_skills_summary=available_skills_summary,
+        rollback_context=rollback_context,
+        historical_context=historical_context,
+    )
+
+    planning_messages = [
+        SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+        HumanMessage(content=user_prompt),
+    ]
+
+    planner_agent = create_react_agent(llm, planning_tools)
+
     start_time = time.time()
-    print("DEBUG: Invoking planner LLM...", flush=True)
+    print("DEBUG: Invoking agentic planner for research...", flush=True)
+
     try:
-        result = chain.invoke({
-            "task_description": state["task_description"],
-            "workspace_context": workspace_context_str,
-            "skill_name": state.get("skill_name") or "Not Specified",
-            "available_skills_summary": available_skills_summary,
-            "rollback_context": rollback_context
-        })
-        duration = time.time() - start_time
-        print(f"DEBUG: Planner LLM response received in {duration:.2f}s. Steps generated: {len(result.steps)}", flush=True)
+        agent_result = planner_agent.invoke(
+            {"messages": planning_messages},
+            config={"callbacks": [DebugCallbackHandler()]}
+        )
+        phase1_duration = time.time() - start_time
+        print(f"\nDEBUG: Phase 1 (research) completed in {phase1_duration:.1f}s", flush=True)
     except Exception as e:
-        print(f"DEBUG: Planner LLM invocation FAILED: {str(e)}", flush=True)
+        print(f"DEBUG: Agentic planner FAILED: {str(e)}", flush=True)
         raise e
 
-    # Convert Pydantic models to TypedDicts for state
+    # Extract research context from the agent's tool interactions
+    agent_messages = agent_result.get("messages", [])
+    research_context = _extract_research_context(agent_messages)
+
+    # Also try to extract the plan the ReAct agent produced — use as candidate 0 (balanced)
+    react_plan = None
+    try:
+        react_plan = _extract_plan_from_messages(agent_messages)
+        print(f"DEBUG: ReAct agent also produced a plan with {len(react_plan.get('steps', []))} steps", flush=True)
+    except ValueError:
+        print("DEBUG: ReAct agent did not submit a plan (will generate all candidates fresh)", flush=True)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 2: GENERATE CANDIDATES
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"PLANNER PHASE 2: Multi-Plan Generation", flush=True)
+    print(f"{'=' * 60}", flush=True)
+
+    escalation_history = []
+
+    # Initial run: 3 candidates
+    candidates = _generate_plan_candidates(
+        num_candidates=DEFAULT_CANDIDATE_COUNT,
+        task_description=task_description,
+        workspace_context=workspace_context_str,
+        research_context=research_context,
+        skill_name=skill_name,
+        available_skills_summary=available_skills_summary,
+        historical_context=historical_context,
+        rollback_context=rollback_context,
+    )
+
+    # If the ReAct agent produced a valid plan, include it as a candidate
+    if react_plan:
+        try:
+            validated = ImplementationPlanInput(**react_plan)
+            candidates.insert(0, {
+                "directive": "react_original",
+                "directive_label": "ReAct Agent Original",
+                "steps_count": len(validated.steps),
+                "plan": validated.model_dump()
+            })
+            print(f"DEBUG: Added ReAct agent's original plan as candidate 0", flush=True)
+        except Exception:
+            print(f"DEBUG: ReAct agent's plan failed validation, excluded.", flush=True)
+
+    if not candidates:
+        raise ValueError("No valid plan candidates were generated. All generation attempts failed.")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 3: JUDGE & SELECT
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"PLANNER PHASE 3: Plan Evaluation & Selection", flush=True)
+    print(f"{'=' * 60}", flush=True)
+
+    evaluation = _judge_plans(candidates, task_description)
+
+    # ─── Adaptive Escalation ───
+    if _should_escalate(evaluation, len(candidates)):
+        reason = evaluation.get("escalation_reason", "Margin too thin or scores too low")
+        print(f"\n🔄 ESCALATION TRIGGERED: {reason}", flush=True)
+        escalation_history.append(f"Round 1: {len(candidates)} candidates, escalating because: {reason}")
+
+        # Generate 2 additional candidates (directives 3-4)
+        extra = _generate_plan_candidates(
+            num_candidates=ESCALATED_CANDIDATE_COUNT,
+            task_description=task_description,
+            workspace_context=workspace_context_str,
+            research_context=research_context,
+            skill_name=skill_name,
+            available_skills_summary=available_skills_summary,
+            historical_context=historical_context,
+            rollback_context=rollback_context,
+        )
+
+        # Add only the new directives (indices 3-4)
+        existing_directives = {c["directive"] for c in candidates}
+        for c in extra:
+            if c["directive"] not in existing_directives:
+                candidates.append(c)
+
+        print(f"DEBUG: After escalation: {len(candidates)} total candidates", flush=True)
+        escalation_history.append(f"Round 2: {len(candidates)} total candidates after escalation")
+
+        # Re-judge with all candidates
+        evaluation = _judge_plans(candidates, task_description)
+
+    # ─── Extract winner ───
+    selected_idx = evaluation.get("selected_index", 0)
+    if selected_idx >= len(candidates):
+        selected_idx = 0
+    winner = candidates[selected_idx]
+    result = winner["plan"]
+
+    print(f"\n🏆 WINNER: {winner['directive_label']} ({winner['steps_count']} steps)", flush=True)
+
+    # ─── Convert to PlanSteps ───
     plan_steps = []
-    for step in result.steps:
+    for step in result["steps"]:
         plan_step: PlanStep = {
-            "step_id": step.step_id,
-            "title": step.title,
-            "description": step.description,
-            "acceptance_criteria": step.acceptance_criteria,
-            "max_attempts": step.max_attempts,
-            "estimated_complexity": step.estimated_complexity,
-            "dependencies": step.dependencies,
+            "step_id": step.get("step_id"),
+            "title": step.get("title"),
+            "description": step.get("description"),
+            "acceptance_criteria": step.get("acceptance_criteria", []),
+            "max_attempts": step.get("max_attempts", 3),
+            "estimated_complexity": step.get("estimated_complexity", "medium"),
+            "dependencies": step.get("dependencies", []),
             "status": "pending",
-            "uses_skills": step.uses_skills,
-            "skill_instructions": step.skill_instructions,
-            "can_run_in_parallel": step.can_run_in_parallel,
+            "uses_skills": step.get("uses_skills", []),
+            "skill_instructions": step.get("skill_instructions"),
+            "can_run_in_parallel": step.get("can_run_in_parallel", False),
             "current_attempt": 1
         }
         plan_steps.append(plan_step)
-            
-    # Persist the plan as a first-class artifact using contract paths
+
+    plan_steps = _enforce_systems_depth_requirements(task_description, plan_steps)
+
+    # ─── Approval Gate ───
+    needs_approval, approval_reason = _needs_approval(evaluation, plan_steps)
+
+    if needs_approval:
+        summary = _format_approval_summary(evaluation, candidates, plan_steps)
+        print(summary, flush=True)
+        print(f"\n⚠️  Approval required: {approval_reason}", flush=True)
+        print("   Auto-proceeding with winning plan (HITL not yet wired).", flush=True)
+        # TODO: When HITL is wired, set awaiting_user_input = True
+        # and let the user select proceed/alt/revise
+
+    # ─── Persist everything ───
     if workspace:
+        task_dir = Path(workspace.task_directory_rel)
+
+        # Save plan_candidates.json (audit trail)
+        _persist_candidates(task_dir, candidates, evaluation, escalation_history)
+
+        # Save winning plan as plan.json
         plan_rel_path = workspace.get_path("plan_path")
-        task_dir_rel = workspace.task_directory_rel
-        if task_dir_rel:
-            plan_path = Path(task_dir_rel) / plan_rel_path
-            plan_data = {
-                "task_id": result.task_id,
-                "task_directory_rel": result.task_directory_rel,
-                "steps": plan_steps
+        plan_path = task_dir / plan_rel_path
+        plan_data = {
+            "task_id": result["task_id"],
+            "task_directory_rel": result["task_directory_rel"],
+            "steps": plan_steps,
+            "selected_from": {
+                "directive": winner["directive"],
+                "candidate_count": len(candidates),
+                "judge_score": evaluation.get("evaluations", [{}])[selected_idx].get("total_score", "N/A")
+                    if evaluation.get("evaluations") and selected_idx < len(evaluation.get("evaluations", []))
+                    else "N/A",
+                "escalated": len(escalation_history) > 0,
             }
-            try:
-                plan_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(plan_path, "w") as f:
-                    json.dump(plan_data, f, indent=2)
-                print(f"DEBUG: Plan persisted to {plan_path}", flush=True)
-            except Exception as e:
-                print(f"DEBUG: Failed to persist plan: {str(e)}", flush=True)
+        }
+        try:
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(plan_path, "w") as f:
+                json.dump(plan_data, f, indent=2)
+            print(f"DEBUG: Winning plan persisted to {plan_path}", flush=True)
+        except Exception as e:
+            print(f"DEBUG: Failed to persist plan: {str(e)}", flush=True)
+
+    total_duration = time.time() - start_time
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"PLANNER: Complete! Total time: {total_duration:.1f}s", flush=True)
+    print(f"  Candidates generated: {len(candidates)}", flush=True)
+    print(f"  Winner: {winner['directive_label']}", flush=True)
+    print(f"  Escalated: {'Yes' if escalation_history else 'No'}", flush=True)
+    print(f"{'=' * 60}", flush=True)
 
     return {
         "implementation_plan": plan_steps,
         "current_step_index": 0,
         "phase": "executing",
-        "progress_reports": [] 
+        "progress_reports": [
+            f"Plan selected: {winner['directive_label']} ({winner['steps_count']} steps)",
+            f"Candidates evaluated: {len(candidates)}",
+            f"Escalated: {'Yes' if escalation_history else 'No'}",
+        ]
     }

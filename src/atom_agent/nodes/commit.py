@@ -32,16 +32,15 @@ def commit_node(state: AgentState) -> Dict[str, Any]:
         return {}
 
     task_dir = Path(workspace.task_directory_rel)
-    
-    # Source: Attempt staging
+
+    # Source: Attempt staging - use workspace contract
     staging_paths = workspace.get_staging_paths(step_id, attempt_id)
-    attempt_dir = task_dir / staging_paths.get("staging_dir", f"steps/{step_id}/attempts/{attempt_id}/") # Fallback if key missing
-    if not attempt_dir.exists():
-        # Fallback manual resolution if staging_paths is incomplete
-        attempt_dir = task_dir / f"steps/{step_id}/attempts/{attempt_id}"
-    
-    # Destination: Committed
-    committed_dir = task_dir / f"steps/{step_id}/committed"
+    attempt_dir_rel = workspace.get_path("attempt_dir", step_id=step_id, attempt_id=attempt_id)
+    attempt_dir = task_dir / attempt_dir_rel
+
+    # Destination: Committed - use workspace contract
+    committed_dir_rel = workspace.get_path("committed_dir", step_id=step_id)
+    committed_dir = task_dir / committed_dir_rel
     
     print(f"DEBUG COMMIT: Promoting {attempt_id} to committed for step {step_id}", flush=True)
     

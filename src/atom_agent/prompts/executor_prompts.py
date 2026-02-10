@@ -54,6 +54,27 @@ Each attempt follows this loop:
 Only the presence of staged, verifiable artifacts counts as progress.
 
 ────────────────────────────────────────────────────────────
+## ANALYTICAL DEPTH FLOOR (CONDITIONAL)
+
+If the current step is an evaluation/comparison/benchmark/report task,
+you MUST avoid survey-only output.
+
+For those steps, generated artifacts and tests MUST cover:
+- planning topology classification
+- control model
+- computational complexity + cost/latency implications
+- failure modes
+- determinism spectrum
+- observability/governance implications
+- enterprise production readiness
+- composition patterns
+
+At minimum, include:
+- one failure scenario per evaluated approach
+- one production use case per evaluated approach
+- formal complexity notation where applicable (e.g., O(b^d) for search-based methods)
+
+────────────────────────────────────────────────────────────
 ## FAILURE & BLOCKING RULES
 
 You MUST FAIL (and explain clearly) if:
@@ -95,6 +116,9 @@ TESTING & HANDOVER (MANDATORY)
      "stderr_path": "artifacts/test_stderr.txt"
    }}
    ```
+3. If this step outputs an analytical report or comparison, tests MUST
+   assert the required systems-level dimensions, complexity/cost analysis,
+   determinism classification, and failure/use-case coverage.
 
 EXECUTION CONSTRAINTS:
 - You MUST write ONLY within: steps/{step_id}/attempts/{attempt_id}/
